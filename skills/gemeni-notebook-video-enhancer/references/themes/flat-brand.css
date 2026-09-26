@@ -1,0 +1,124 @@
+/* Flat 2D brand theme (from the Jeppesen ForeFlight "Airflow" remake, 1920×1080 stage rendered at 4K).
+   Drop-in replacement for src/style.css when the brief says "professional / corporate / 2D / match our site".
+   Swap the :root tokens for the brand's (scripts/brand-from-site.sh) and keep the structure. */
+@import '@fontsource-variable/inter-tight';
+@import '@fontsource-variable/inter';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/700.css';
+
+/* Jeppesen ForeFlight "Airflow" tokens (ai.jeppesenforeflight.com) */
+:root {
+  --navy: #001629;
+  --n-800: #0d2338;
+  --n-700: #1e3347;
+  --n-600: #3a4f61;
+  --n-500: #5c7283;
+  --n-400: #8ea4b0;
+  --n-300: #b8ccd5;
+  --moon: #19a2ae;
+  --teal: #15a2ae;
+  --deep: #006379;
+  --electric: #6af4f9;
+  --glow: #ffa05c;
+  --pumpkin: #ff791a;
+  --red: #ff4d5e;
+  --green: #3fd6a0;
+  --fog: #ebebeb;
+  --ink: #ffffff;
+  --muted: rgba(255, 255, 255, 0.62);
+  --line: rgba(255, 255, 255, 0.16);
+  --line-strong: rgba(255, 255, 255, 0.32);
+  --head: 'Inter Tight Variable', 'Inter Variable', system-ui, sans-serif;
+  --body: 'Inter Variable', system-ui, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, monospace;
+  --brand: linear-gradient(120deg, #15a2ae 0%, #6fb3a0 50%, #ffa05c 100%);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: #000a14; overflow: hidden; width: 100%; height: 100%; }
+
+#stage {
+  position: absolute; left: 0; top: 0;
+  overflow: hidden; /* width/height set from config.json in main.js */
+  background: var(--navy); transform-origin: 0 0;
+  font-family: var(--body); color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+#bg { position: absolute; inset: 0; width: 100% !important; height: 100% !important; }
+#world { position: absolute; inset: 0; }
+#fx { position: absolute; inset: 0; overflow: visible; }
+#hero { fill: url(#heroFill); stroke: url(#heroStroke); stroke-width: 2.5; stroke-linejoin: round; }
+.hero-glow { fill: none; stroke: url(#heroStroke); stroke-width: 10; opacity: 0.22; }
+#ui { position: absolute; inset: 0; }
+#grain {
+  position: absolute; inset: -200px; pointer-events: none; opacity: 0.035; mix-blend-mode: overlay;
+  background-size: 256px 256px;
+}
+#vignette {
+  position: absolute; inset: 0; pointer-events: none;
+  background: radial-gradient(ellipse 80% 75% at 50% 48%, transparent 55%, rgba(0, 8, 18, 0.7) 100%);
+}
+#playhint {
+  position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  font: 600 22px var(--body); color: #fff; background: rgba(0,0,0,.6); padding: 14px 24px;
+  border-radius: 999px; display: none; cursor: pointer; z-index: 10;
+}
+body.preview #playhint.show { display: block; }
+
+/* ---------- primitives ---------- */
+.abs { position: absolute; left: 0; top: 0; will-change: transform, opacity; }
+
+/* flat 2D panel with hairline border (site: surface-raised + --ff-border) */
+.panel {
+  background: linear-gradient(180deg, rgba(20, 44, 66, 0.92), rgba(9, 30, 50, 0.92));
+  border: 1.5px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 24px 60px -24px rgba(0, 0, 0, 0.7);
+}
+.panel.hi { border-color: rgba(106, 244, 249, 0.55); }
+/* legacy names used by helpers */
+.glass, .glass-lite { background: linear-gradient(180deg, rgba(20,44,66,.92), rgba(9,30,50,.92)); border: 1.5px solid var(--line); border-radius: 14px; }
+
+.ico svg { width: 100%; height: 100%; display: block; }
+.grad-text { background: var(--brand); -webkit-background-clip: text; background-clip: text; color: transparent; }
+
+.eyebrow { font: 500 18px/1 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--glow); white-space: nowrap; }
+.h1 { font: 650 76px/1.02 var(--head); letter-spacing: -0.025em; white-space: nowrap; }
+.h2 { font: 600 44px/1.08 var(--head); letter-spacing: -0.02em; white-space: nowrap; }
+.label { font: 600 26px/1.1 var(--head); letter-spacing: -0.01em; white-space: nowrap; }
+.mono { font-family: var(--mono); }
+.muted { color: var(--muted); }
+
+/* scene title (top-left, site-style eyebrow + heading) */
+.title { display: flex; flex-direction: column; gap: 16px; white-space: nowrap; }
+.title .row1 { display: flex; align-items: center; gap: 14px; }
+.title .num { font: 700 18px/1 var(--mono); letter-spacing: .14em; color: var(--glow); }
+.title .bar { width: 46px; height: 2px; background: var(--glow); transform-origin: 0 50%; }
+.title .of { font: 500 18px/1 var(--mono); letter-spacing: .14em; color: var(--n-400); }
+.title .name { font: 650 58px/1 var(--head); letter-spacing: -0.02em; }
+.title .name .ch { display: inline-block; }
+
+/* chips / labels */
+.chip {
+  display: flex; align-items: center; gap: 12px; padding: 12px 20px; border-radius: 999px;
+  font: 600 24px/1 var(--head); white-space: nowrap;
+  background: rgba(13, 35, 56, 0.9); border: 1.5px solid var(--line);
+}
+.chip .ico { width: 26px; height: 26px; }
+.tag { font: 600 16px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; padding: 8px 12px; border-radius: 6px; white-space: nowrap; }
+.stamp { font: 700 30px/1 var(--mono); letter-spacing: .16em; padding: 12px 20px; border: 3px solid currentColor; border-radius: 8px; white-space: nowrap; }
+
+/* graph node */
+.node { display: flex; align-items: center; gap: 12px; padding: 14px 22px; border-radius: 12px; font: 600 26px/1 var(--head); white-space: nowrap; }
+.node .ico { width: 30px; height: 30px; }
+
+/* layer stack slot */
+.slot { display: flex; align-items: center; gap: 0.7em; padding: 0 0.9em; overflow: hidden; white-space: nowrap; }
+.slot .sn { font: 700 0.62em/1 var(--mono); letter-spacing: .1em; color: var(--glow); }
+.slot .sl { font: 600 1em/1 var(--head); letter-spacing: -0.01em; }
+.slot .acc { position: absolute; left: 0; top: 0; bottom: 0; width: 5px; background: var(--electric); }
+.slot .ok { margin-left: auto; width: 0.9em; height: 0.9em; color: var(--green); }
+
+/* cursor */
+.cursor { width: 56px; height: 56px; filter: drop-shadow(0 8px 14px rgba(0,0,0,.55)); z-index: 50; }
+.ripple { width: 80px; height: 80px; border-radius: 50%; border: 3px solid rgba(255,255,255,.9); }

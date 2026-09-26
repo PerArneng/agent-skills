@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Motion remake</title>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="bg"></canvas>
+    <div id="world">
+      <svg id="fx">
+        <defs>
+          <linearGradient id="heroStroke" x1="0" y1="0" x2="1" y2="1">
+            <stop id="hs1" offset="0" stop-color="#22d3ee" />
+            <stop id="hs2" offset="0.5" stop-color="#a78bfa" />
+            <stop id="hs3" offset="1" stop-color="#f472b6" />
+          </linearGradient>
+          <radialGradient id="heroFill" cx="0.5" cy="0.35" r="0.8">
+            <stop id="hf1" offset="0" stop-color="#8b5cf6" stop-opacity="0.32" />
+            <stop id="hf2" offset="1" stop-color="#0ea5e9" stop-opacity="0.04" />
+          </radialGradient>
+          <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+            <feGaussianBlur stdDeviation="22" />
+          </filter>
+        </defs>
+        <g id="heroG">
+          <use href="#hero" class="hero-glow" filter="url(#glow)" />
+          <path id="hero" />
+        </g>
+      </svg>
+      <div id="ui"></div>
+    </div>
+    <div id="grain"></div>
+    <div id="vignette"></div>
+  </div>
+  <div id="playhint">click to play ▶</div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

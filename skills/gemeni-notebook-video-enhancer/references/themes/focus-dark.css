@@ -1,0 +1,135 @@
+/* Focus dark theme — the skill's DEFAULT palette (confirm with the user first; see SKILL.md → Default choices).
+   Drop-in replacement for src/style.css. Pair with themes/flat-chart-bg.js (set its base to vec3(0.071, 0.078, 0.094))
+   and the presets in themes/focus-palette.md. Structure is flat-brand.css; only the tokens differ. */
+@import '@fontsource-variable/inter-tight';
+@import '@fontsource-variable/inter';
+@import '@fontsource-variable/oswald';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/700.css';
+
+/* Focus palette — soft charcoal, off-white text, desaturated amber (attention) + periwinkle (system) */
+:root {
+  --navy: #121418;
+  --n-800: #1a1d23;
+  --n-700: #23272e;
+  --n-600: #3a3f48;
+  --n-500: #5f6670;
+  --n-400: #9aa0a6;
+  --n-300: #c4c7cc;
+  --moon: #6e9cf0;
+  --teal: #78d9c8;
+  --deep: #2a3f66;
+  --electric: #8ab4f8;
+  --blue: #6e9cf0;
+  --glow: #f2b45a;
+  --orange: #f2b45a;
+  --pumpkin: #e0963a;
+  --red: #f28b82;
+  --green: #81c995;
+  --fog: #e8eaed;
+  --ink: #e8eaed;
+  --muted: rgba(232,234,237,0.6);
+  --line: rgba(255,255,255, 0.14);
+  --line-strong: rgba(255,255,255, 0.3);
+  --head: 'Inter Tight Variable', 'Inter Variable', system-ui, sans-serif;
+  --body: 'Inter Variable', system-ui, sans-serif;
+  --disp: 'Oswald Variable', 'Inter Tight Variable', sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, monospace;
+  --brand: linear-gradient(120deg, #f2b45a 0%, #f5d29a 45%, #8ab4f8 100%);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: #0b0c0f; overflow: hidden; width: 100%; height: 100%; }
+
+#stage {
+  position: absolute; left: 0; top: 0;
+  overflow: hidden; /* width/height set from config.json in main.js */
+  background: var(--navy); transform-origin: 0 0;
+  font-family: var(--body); color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+#bg { position: absolute; inset: 0; width: 100% !important; height: 100% !important; }
+#world { position: absolute; inset: 0; }
+#fx { position: absolute; inset: 0; overflow: visible; }
+#hero { fill: url(#heroFill); stroke: url(#heroStroke); stroke-width: 2.5; stroke-linejoin: round; }
+.hero-glow { fill: none; stroke: url(#heroStroke); stroke-width: 10; opacity: 0.22; }
+#ui { position: absolute; inset: 0; }
+#grain {
+  position: absolute; inset: -200px; pointer-events: none; opacity: 0.035; mix-blend-mode: overlay;
+  background-size: 256px 256px;
+}
+#vignette {
+  position: absolute; inset: 0; pointer-events: none;
+  background: radial-gradient(ellipse 80% 75% at 50% 48%, transparent 55%, rgba(8,9,11, 0.72) 100%);
+}
+#playhint {
+  position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  font: 600 22px var(--body); color: #fff; background: rgba(0,0,0,.6); padding: 14px 24px;
+  border-radius: 999px; display: none; cursor: pointer; z-index: 10;
+}
+body.preview #playhint.show { display: block; }
+
+/* ---------- primitives ---------- */
+.abs { position: absolute; left: 0; top: 0; will-change: transform, opacity; }
+
+/* flat 2D panel with hairline border (site: surface-raised + --ff-border) */
+.panel {
+  background: linear-gradient(180deg, rgba(34,37,44, 0.94), rgba(24,26,31, 0.94));
+  border: 1.5px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 24px 60px -24px rgba(0,0,0, 0.7);
+}
+.panel.hi { border-color: rgba(138,180,248, 0.6); }
+/* legacy names used by helpers */
+.glass, .glass-lite { background: linear-gradient(180deg, rgba(34,37,44,.94), rgba(24,26,31,.94)); border: 1.5px solid var(--line); border-radius: 14px; }
+
+.ico svg { width: 100%; height: 100%; display: block; }
+.grad-text { background: var(--brand); -webkit-background-clip: text; background-clip: text; color: transparent; }
+
+.eyebrow { font: 500 18px/1 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--glow); white-space: nowrap; }
+.h1 { font: 650 76px/1.02 var(--head); letter-spacing: -0.025em; white-space: nowrap; }
+.h2 { font: 600 44px/1.08 var(--head); letter-spacing: -0.02em; white-space: nowrap; }
+.label { font: 600 26px/1.1 var(--head); letter-spacing: -0.01em; white-space: nowrap; }
+.mono { font-family: var(--mono); }
+.muted { color: var(--muted); }
+
+/* scene title (top-left, site-style eyebrow + heading) */
+.title { display: flex; flex-direction: column; gap: 16px; white-space: nowrap; }
+.title .row1 { display: flex; align-items: center; gap: 14px; }
+.title .num { font: 700 18px/1 var(--mono); letter-spacing: .14em; color: var(--glow); }
+.title .bar { width: 46px; height: 2px; background: var(--glow); transform-origin: 0 50%; }
+.title .of { font: 500 18px/1 var(--mono); letter-spacing: .14em; color: var(--n-400); }
+.title .name { font: 650 58px/1 var(--head); letter-spacing: -0.02em; }
+.title .name .ch { display: inline-block; }
+
+/* chips / labels */
+.chip {
+  display: flex; align-items: center; gap: 12px; padding: 12px 20px; border-radius: 999px;
+  font: 600 24px/1 var(--head); white-space: nowrap;
+  background: rgba(26,28,34, 0.92); border: 1.5px solid var(--line);
+}
+.chip .ico { width: 26px; height: 26px; }
+.tag { font: 600 16px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; padding: 8px 12px; border-radius: 6px; white-space: nowrap; }
+.stamp { font: 700 30px/1 var(--mono); letter-spacing: .16em; padding: 12px 20px; border: 3px solid currentColor; border-radius: 8px; white-space: nowrap; }
+
+/* graph node */
+.node { display: flex; align-items: center; gap: 12px; padding: 14px 22px; border-radius: 12px; font: 600 26px/1 var(--head); white-space: nowrap; }
+.node .ico { width: 30px; height: 30px; }
+
+/* layer stack slot */
+.slot { display: flex; align-items: center; gap: 0.7em; padding: 0 0.9em; overflow: hidden; white-space: nowrap; }
+.slot .sn { font: 700 0.62em/1 var(--mono); letter-spacing: .1em; color: var(--glow); }
+.slot .sl { font: 600 1em/1 var(--head); letter-spacing: -0.01em; }
+.slot .acc { position: absolute; left: 0; top: 0; bottom: 0; width: 5px; background: var(--electric); }
+.slot .ok { margin-left: auto; width: 0.9em; height: 0.9em; color: var(--green); }
+
+/* cursor */
+.cursor { width: 56px; height: 56px; filter: drop-shadow(0 8px 14px rgba(0,0,0,.55)); z-index: 50; }
+.ripple { width: 80px; height: 80px; border-radius: 50%; border: 3px solid rgba(255,255,255,.9); }
+
+/* ---------- project components ---------- */
+.disp { font-family: var(--disp); font-weight: 650; text-transform: uppercase; letter-spacing: 0.01em; line-height: .95; white-space: nowrap; }
+.big-num { font: 700 120px/1 var(--mono); letter-spacing: -0.04em; white-space: nowrap; }
+.row-bar { height: 12px; border-radius: 6px; background: rgba(255,255,255,.08); }
+.code { font: 500 19px/1.55 var(--mono); white-space: pre; color: var(--n-300); }
+.code .k { color: var(--glow); } .code .f { color: var(--electric); } .code .s { color: var(--green); } .code .c { color: var(--n-500); }
