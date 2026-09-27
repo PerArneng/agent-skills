@@ -1,0 +1,103 @@
+@import '@fontsource-variable/inter';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/700.css';
+
+/* Color roles (fixed meanings for the whole series):
+   --bg ground · --struct/--panel/--muted structure neutrals · --ink text
+   --accent the ONE live idea · --amber retrieval / your turn / warning
+   --source analogy source (desaturated member of the accent family) */
+:root {
+  --bg: #0e1a21;
+  --panel: #12242d;
+  --term: #0a141a;
+  --struct: #35505e;
+  --muted: #8ba2af;
+  --kw: #a9bdc8;
+  --ink: #e6eef2;
+  --accent: #3ed1c7;
+  --amber: #f2b84b;
+  --source: #76a9a5;
+  --body: 'Inter Variable', system-ui, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: #081015; overflow: hidden; width: 100%; height: 100%; }
+
+#stage {
+  position: absolute; left: 0; top: 0; overflow: hidden;
+  background: var(--bg); transform-origin: 0 0;
+  font-family: var(--body); color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+#world, #ui { position: absolute; inset: 0; }
+.abs { position: absolute; left: 0; top: 0; will-change: transform, opacity; }
+
+#playhint {
+  position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  font: 600 22px var(--body); color: var(--ink); background: rgba(0,0,0,.6);
+  padding: 14px 24px; border-radius: 12px; display: none; cursor: pointer; z-index: 99;
+}
+#playhint.show { display: block; }
+
+/* segment title (orientation; faint while the segment runs) */
+.seg { font: 600 26px/1 var(--body); color: var(--muted); letter-spacing: .01em; white-space: nowrap; }
+.seg b { color: var(--ink); font-weight: 600; margin-right: 10px; }
+
+/* labels on diagrams */
+.lbl { font: 500 26px/1 var(--body); color: var(--muted); white-space: nowrap; }
+.lbl.src { color: var(--source); }
+.lbl.ink { color: var(--ink); }
+.word { font: 600 30px/1 var(--body); color: var(--ink); white-space: nowrap; }
+
+/* cards and chips */
+.card {
+  font: 500 26px/1.25 var(--body); color: var(--ink); background: var(--panel);
+  border: 2px solid var(--struct); border-radius: 14px; padding: 16px 22px; white-space: nowrap;
+}
+.card.small { font-size: 21px; padding: 11px 16px; border-radius: 11px; }
+.card.muted { color: var(--muted); }
+.chip {
+  font: 500 22px/1 var(--mono); color: var(--ink); background: var(--panel);
+  border: 2px solid var(--struct); border-radius: 10px; padding: 12px 16px; white-space: nowrap;
+}
+.chip.big { font-size: 28px; padding: 16px 22px; }
+
+/* code panel */
+.code {
+  background: var(--panel); border: 2px solid var(--struct); border-radius: 16px;
+  overflow: hidden;
+}
+.code .hdr { font: 500 22px/1 var(--body); color: var(--muted); padding: 18px 24px 8px; }
+.code .win { position: relative; overflow: hidden; }
+.code .scroll { position: absolute; left: 0; top: 0; right: 0; }
+.code .band {
+  position: absolute; left: 52px; right: 10px; border-radius: 8px;
+  background: rgba(62, 209, 199, 0.10); box-shadow: inset 5px 0 0 var(--accent); opacity: 0;
+}
+.code .ln { display: flex; font: 500 var(--fs, 26px)/var(--lh, 40px) var(--mono); white-space: pre; }
+.code .num { width: 58px; text-align: right; padding-right: 22px; color: var(--struct); flex: none; }
+.code .src { color: var(--ink); padding-left: 14px; }
+.code .kw { color: var(--kw); }
+.code .cm { color: var(--muted); }
+.code .tok { transition: none; }
+.mark {
+  position: absolute; border: 3px solid var(--amber); border-radius: 10px; opacity: 0;
+}
+
+/* terminal */
+.term {
+  background: var(--term); border: 2px solid var(--struct); border-radius: 16px; overflow: hidden;
+}
+.term .hdr { font: 500 21px/1 var(--body); color: var(--muted); padding: 16px 22px 8px; }
+.term .win { position: relative; overflow: hidden; }
+.term .body { position: absolute; left: 22px; right: 22px; top: 0; }
+.term .tl { font: 500 var(--fs, 23px)/var(--lh, 36px) var(--mono); white-space: pre; color: var(--ink); }
+.term .tl .p { color: var(--muted); }
+.term .tl.hi { color: var(--accent); }
+.term .tl.dim { color: var(--muted); }
+.term .caret { color: var(--ink); }
+
+/* retrieval overlay */
+.veil { position: absolute; inset: 0; background: var(--bg); opacity: 0; }
+.ask { font: 600 44px/1.2 var(--body); color: var(--amber); white-space: nowrap; text-align: center; }

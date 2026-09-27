@@ -1,0 +1,9 @@
+build/
+out/
+.venv/
+__pycache__/
+web/node_modules/
+web/dist/
+web/shots/
+web/.render*/
+web/public/*.m4a

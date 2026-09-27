@@ -1,0 +1,17 @@
+{
+  "skill_name": "coding-tutorial-video",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "make a tutorial video on setting up ansible to configure a remote ubuntu box: inventory, ad-hoc ping, a playbook that installs nginx. Stop after the storyboard (script.py, ep1.js, contact sheet) — don't synthesize audio or render yet.",
+      "expected_output": "A real ansible project run against a container/VM with captured output; a script.py with 5-9 ideas, pre-training of control node/inventory/SSH/host, retrieval asks per segment, an analogy with a break; an ep1.js using FlowMap/CodePanel/Terminal cued with word(); an estimate-mode contact sheet reviewed for overlaps and single accent.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "I want a short explainer video for our team on how our repo's GitHub Actions CI works (the workflow in .github/workflows/ci.yml). 4k, narrated. Plan it and build the first episode storyboard only.",
+      "expected_output": "Reads the real workflow file, captures a real local run (e.g. act or the steps run locally) or states what cannot be run; plans episodes <= 7 min; FlowMap of commit -> jobs -> steps; storyboard contact sheet.",
+      "files": []
+    }
+  ]
+}
