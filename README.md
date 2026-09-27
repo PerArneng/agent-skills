@@ -12,6 +12,7 @@ deliberately project-agnostic: drop any of them into any repository and it appli
 |---|---|
 | [`python-architecture`](skills/python-architecture/SKILL.md) | Interface-first, dependency-injected Python architecture: Protocols and Pydantic models in an `interfaces` package, implementations in a mirroring `modules` package, one class per file, IO confined to edge modules, fully testable in memory. |
 | [`gemeni-notebook-video-enhancer`](skills/gemeni-notebook-video-enhancer/SKILL.md) | Remakes a narrated presentation video (NotebookLM / Gemini video overviews, slide recordings) as a fluid motion-graphics video with the original voice-over: word-timed scenes in GSAP + Three.js, rendered frame-accurately with headless Chromium + ffmpeg to 9:16, 1080p or 4K. Defaults to a calm "focus dark" palette (confirmed with the user first); neon-glass and brand-matched styles as alternatives. |
+| [`fluid-learning-video`](skills/fluid-learning-video/SKILL.md) | Science-based rules for narrated fluid-motion learning videos built for maximum knowledge transfer: content architecture, morph-over-cut motion, easing and holds, color as a signaling code, voice pacing and script, retrieval and spacing, analogies, and a pre-ship checklist. Grounded in multimedia-learning research (Mayer, Sweller, Tversky, Gentner). |
 
 ## Usage
 
