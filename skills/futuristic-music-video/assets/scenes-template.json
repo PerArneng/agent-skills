@@ -1,0 +1,7 @@
+{
+ "_doc": "Lyric-driven graphic scenes for overlay.html. While a scene is active the base HUD steps back and the scene's graphic takes over; between scenes the HUD returns. from/to: seconds, or lyric phrase text from assets/overlay/lyrics.json (prefix match, '#2' = 2nd occurrence, 'phrase+1.5' = 1.5 s after it); to may be '+N' = N s after from. lyric: left|right|center while the scene is on. Scene functions live in SCENES in overlay.html.",
+ "scenes": [
+  {"scene": "loop",     "from": "Agents in the loop",          "to": "Optimizing profit", "lyric": "left"},
+  {"scene": "progress", "from": "The transition is finished",  "to": "+4",                "lyric": "left"}
+ ]
+}

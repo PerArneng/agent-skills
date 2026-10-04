@@ -1,0 +1,741 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>overlay</title>
+<!--
+  Machine-layer overlay. A pure function of time: window.seek(t) draws song-time t.
+  Contract: no timers, no Date.now/performance.now, no requestAnimationFrame, no CSS transitions,
+  no unseeded Math.random. Transparent background; assembly composites it over plates.
+
+  Data comes from window.__DATA__ = {beats, lyrics, storyboard} injected by render_overlay.mjs.
+  For a live browser preview, serve the project root (npx serve .) and open
+  /assets/overlay/overlay.html?preview=1 — it fetches the default paths below and plays the timeline.
+
+  Customise per video: TOKENS (from the bible), the VOCAB section, lyric styling, and SCENES.
+  4K: layout is authored in 1920x1080 CSS px; the canvas backing store is devicePixelRatio-scaled, so
+  `render_overlay.mjs --scale 2` gives crisp 3840x2160 frames with no layout changes.
+  Scenes: lyric-driven graphics that take over from the HUD for specific lines, then hand back to it.
+  When = assets/overlay/scenes.json (anchored to lyric phrases), what = the SCENES functions below.
+  A HUD that is on screen the whole song gets boring; aim for a scene on most lyric lines that have a concrete image.
+-->
+<style>
+  :root {
+    --bg:   #07090C;
+    --cool: #7CFFE1;
+    --warn: #FFB25A;
+    --type: #EDEFF2;
+    --dim:  #3A4650;
+    --font-display: "Helvetica Neue", "Arial Narrow", Arial, sans-serif;
+    --font-mono: Menlo, "SF Mono", Consolas, monospace;
+  }
+  html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; background: transparent; }
+  body.green { background: #00FF00; }
+  canvas { display: block; width: 1920px; height: 1080px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<canvas id="gl" style="display:none"></canvas>
+<!-- 3D layer (optional): three.js + world3d.js, served from disk by render_overlay.mjs (http://overlay.local).
+     Copy $SKILL/assets/world3d.js next to this file. ?gl=off or a missing module -> 2D only. -->
+<script type="importmap">{"imports": {"three": "/__three/three.module.js", "three/addons/": "/__three_addons/"}}</script>
+<script type="module">
+  import * as THREE from 'three';
+  import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+  import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+  import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+  import { createWorld3D } from './world3d.js';
+  window.__three = { THREE, LINES: { LineSegments2, LineSegmentsGeometry, LineMaterial }, createWorld3D };
+  window.dispatchEvent(new Event('three-ready'));
+</script>
+<script>
+(() => {
+  const W = 1920, H = 1080;
+  const cv = document.getElementById('c');
+  const DPR = window.devicePixelRatio || 1;                  // 2 with render_overlay.mjs --scale 2
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  let g = cv.getContext('2d');                         // let: panel layers draw into offscreen canvases (see seek)
+  const qs = new URLSearchParams(location.search);
+  if (qs.get('bg') === 'green') document.body.classList.add('green');
+
+  // ---------- tokens (keep names; values come from the bible) ----------
+  const css = getComputedStyle(document.documentElement);
+  const T = k => css.getPropertyValue(k).trim();
+  const C = { bg: T('--bg'), cool: T('--cool'), warn: T('--warn'), type: T('--type'), dim: T('--dim') };
+  const FONT_D = T('--font-display'), FONT_M = T('--font-mono');
+
+  // ---------- deterministic helpers ----------
+  const hash = (i, s = 0) => { let x = Math.sin(i * 127.1 + s * 311.7) * 43758.5453; return x - Math.floor(x); };
+  const rand = (seed) => hash(seed, 7.3);                     // seeded 0..1
+  const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+  const lerp = (a, b, k) => a + (b - a) * k;
+  const ease = k => 1 - Math.pow(1 - clamp(k), 4);            // ~cubic-bezier(.16,1,.3,1)
+  const easeIn = k => Math.pow(clamp(k), 3);                  // for faster exits
+  const spring = (age, w = 18, z = 0.45) =>                   // closed-form damped spring 0→1
+    age <= 0 ? 0 : 1 - Math.exp(-z * w * age) * Math.cos(w * Math.sqrt(1 - z * z) * age);
+  const alpha = (hex, a) => {
+    const n = parseInt(hex.replace('#', ''), 16);
+    return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${clamp(a)})`;
+  };
+  // last event at or before t in a sorted array → {i, time, age}
+  function last(t, arr) {
+    let lo = 0, hi = arr.length - 1, i = -1;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (arr[m] <= t) { i = m; lo = m + 1; } else hi = m - 1; }
+    return i < 0 ? { i: -1, time: -1e9, age: 1e9 } : { i, time: arr[i], age: t - arr[i] };
+  }
+
+  // ---------- data ----------
+  let B = { duration: 60, bpm: 120, fps: 30, beats: [], downbeats: [], onsets: [], strong_onsets: [], loudness: [], sections: [] };
+  let LYR = [];      // [{t, text, end?}]
+  let SB = null;     // storyboard {cuts:[...]}
+  // Music events from scripts/drops.py, passed through storyboard.markers.drops: [{t, kind, strength, dir?}]
+  // kind: drop | break | beat_change | build. The storyboard already cuts on them; the overlay hits them too.
+  let EV = [];
+  const eventNear = (t0, kind, win, minS = 0.3) =>
+    EV.find(e => e.kind === kind && e.strength >= minS && Math.abs(e.t - t0) <= win) || null;
+  const lastEvent = (t, kind, minS = 0.3) => {                 // most recent event of a kind → {e, age}
+    let r = null; for (const e of EV) if (e.kind === kind && e.strength >= minS && e.t <= t) r = e;
+    return r ? { e: r, age: t - r.t } : { e: null, age: 1e9 };
+  };
+  const loud = t => {
+    const L = B.loudness; if (!L.length) return 0.5;
+    const f = t * B.fps, i = Math.floor(f), k = f - i;
+    return lerp(L[clamp(i, 0, L.length - 1)], L[clamp(i + 1, 0, L.length - 1)], k);
+  };
+  const sectionAt = t => B.sections.find(s => t >= s.start && t < s.end) || { label: 'mid', start: 0, end: B.duration };
+  const cutAt = t => SB ? SB.cuts.find(c => t >= c.start && t < c.end) || null : null;
+  // How much machine to show: full HUD on verses/machine rows, thin on chorus plates.
+  const density = t => {
+    const c = cutAt(t);
+    if (c) return c.layer === 'plate' && !c.pip ? (c.section === 'chorus' ? 0.3 : 0.55) : 1;
+    return sectionAt(t).label === 'high' ? 0.45 : 1;
+  };
+
+  // ---------- VOCAB: the machine parts ----------
+  function ribbon(t, d) {
+    if (WORLD) return;                                   // the 3D layer draws silk ribbons instead
+    const L = loud(t), strands = 7, y0 = H * 0.68;
+    g.lineCap = 'round';
+    for (let s = 0; s < strands; s++) {
+      const ph = s * 0.9, amp = (30 + 140 * L) * (0.6 + 0.4 * Math.sin(t * 0.7 + s));
+      g.beginPath();
+      for (let x = -20; x <= W + 20; x += 16) {
+        const u = x / W;
+        const y = y0 + Math.sin(u * 6.0 + t * 1.3 + ph) * amp * 0.6
+                     + Math.sin(u * 13.0 - t * 2.1 + ph * 2) * amp * 0.25
+                     + Math.sin(u * 2.0 + t * 0.4) * 40 + (s - strands / 2) * (4 + 10 * L);
+        x === -20 ? g.moveTo(x, y) : g.lineTo(x, y);
+      }
+      const hot = s === 3;
+      g.strokeStyle = alpha(hot && L > 0.8 ? C.warn : C.cool, (hot ? 0.9 : 0.25 + 0.1 * s / strands) * d);
+      g.lineWidth = hot ? 1.5 + 5 * L : 1;
+      g.stroke();
+    }
+  }
+
+  function gimbal(t, d) {
+    const cx = W * 0.72, cy = H * 0.42, db = last(t, B.downbeats);
+    // step rotation: each downbeat kicks the ring a quarter-step, eased
+    const kick = (db.i + ease(db.age / 0.35)) * (Math.PI / 8);
+    const rings = [
+      { r: 300, rate: 0.10, ticks: 120, w: 1, col: C.dim },
+      { r: 250, rate: -0.22, ticks: 36, w: 2, col: C.cool, k: 1 },
+      { r: 190, rate: 0.35, ticks: 12, w: 1, col: C.cool, k: -1 },
+      { r: 120, rate: -0.6, ticks: 4, w: 3, col: C.warn, k: 2 },
+    ];
+    rings.forEach((R, n) => {
+      const a0 = t * R.rate + (R.k || 0) * kick;
+      g.save(); g.translate(cx, cy); g.rotate(a0);
+      g.strokeStyle = alpha(R.col, 0.75 * d); g.lineWidth = R.w;
+      // ring is drawn in arcs with gaps, more mechanical than a full circle
+      for (let s = 0; s < 3; s++) { g.beginPath(); g.arc(0, 0, R.r, s * 2.094 + 0.12, s * 2.094 + 1.9); g.stroke(); }
+      for (let i = 0; i < R.ticks; i++) {
+        const a = i / R.ticks * Math.PI * 2, long = i % 5 === 0;
+        g.beginPath(); g.moveTo(Math.cos(a) * R.r, Math.sin(a) * R.r);
+        g.lineTo(Math.cos(a) * (R.r - (long ? 14 : 6)), Math.sin(a) * (R.r - (long ? 14 : 6))); g.stroke();
+      }
+      g.restore();
+    });
+    // crosshair + pulse on strong onsets
+    const so = last(t, B.strong_onsets), p = Math.exp(-so.age * 6);
+    g.strokeStyle = alpha(C.type, 0.5 * d); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(cx - 340, cy); g.lineTo(cx + 340, cy); g.moveTo(cx, cy - 340); g.lineTo(cx, cy + 340); g.stroke();
+    g.fillStyle = alpha(C.warn, (0.2 + 0.8 * p) * d);
+    g.beginPath(); g.arc(cx, cy, 6 + 18 * p, 0, Math.PI * 2); g.fill();
+  }
+
+  function tickRail(t, d) {
+    const y = H - 70, span = 8, px = W / span; // 8 s visible, playhead at centre
+    g.strokeStyle = alpha(C.dim, 0.9 * d); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(96, y); g.lineTo(W - 96, y); g.stroke();
+    const draw = (arr, h, col, a) => {
+      for (const b of arr) {
+        const x = W / 2 + (b - t) * px; if (x < 96 || x > W - 96) continue;
+        const near = Math.exp(-Math.abs(b - t) * 8);
+        g.strokeStyle = alpha(col, (a + near) * d);
+        g.beginPath(); g.moveTo(x, y - h - 10 * near); g.lineTo(x, y); g.stroke();
+      }
+    };
+    draw(B.beats, 8, C.dim, 0.6); draw(B.downbeats, 22, C.cool, 0.5);
+    g.fillStyle = alpha(C.warn, d); g.fillRect(W / 2 - 1, y - 34, 2, 44);
+  }
+
+  function hud(t, d) {
+    const s = sectionAt(t), c = cutAt(t);
+    g.font = `500 18px ${FONT_M}`; g.fillStyle = alpha(C.type, 0.7 * d); g.textBaseline = 'top';
+    const tc = `${String(Math.floor(t / 60)).padStart(2, '0')}:${(t % 60).toFixed(2).padStart(5, '0')}`;
+    g.fillText(`T ${tc}`, 96, 54);
+    g.fillText(`BPM ${B.bpm.toFixed(1)}`, 96, 80);
+    g.fillStyle = alpha(C.cool, 0.8 * d);
+    g.fillText(`SEC ${(c?.section || s.label).toUpperCase()}`, 96, 106);
+    // abstract coordinates, seeded per downbeat so they change on the beat, not every frame
+    const db = last(t, B.downbeats).i;
+    g.textAlign = 'right'; g.fillStyle = alpha(C.type, 0.5 * d);
+    g.fillText(`${(rand(db) * 90).toFixed(4)}N ${(rand(db + 99) * 180).toFixed(4)}E`, W - 96, 54);
+    g.fillText(`GAIN ${(loud(t) * 100).toFixed(0).padStart(3, '0')}`, W - 96, 80);
+    g.textAlign = 'left';
+  }
+
+  function lyric(t) {
+    if (!LYR.length) return;
+    let cur = null;
+    for (let i = LYR.length - 1; i >= 0; i--) if (LYR[i].t <= t) { cur = LYR[i]; break; }
+    if (!cur) return;
+    const end = cur.end ?? cur.t + 2.5, age = t - cur.t;
+    if (t > end) return;
+    // a phrase that starts within a beat of a bass drop SLAMS in: overshooting spring, shake, bigger scale
+    const slam = eventNear(cur.t, 'drop', 60 / B.bpm);
+    const inK = slam ? spring(age, 22, 0.32) : spring(age), outK = easeIn((t - (end - 0.12)) / 0.12); // exit faster than entrance
+    const a = clamp(inK) * (1 - outK);
+    const scale = slam ? 1.35 - 0.35 * inK : 0.85 + 0.15 * inK;
+    const shake = slam && age < 0.25 ? (hash(Math.floor(t * 30), 3) - 0.5) * 18 * (1 - age / 0.25) : 0;
+    // position: the active scene's `lyric`, else the cut's overlay.lyric, else left. During a scene the
+    // right half is the scene's stage, so a left lyric is width-limited to stay out of it.
+    const pos = sceneAt(t)?.s.lyric || cutAt(t)?.overlay?.lyric || 'left';
+    const text = cur.text.toUpperCase();
+    let size = 132;
+    g.font = `800 ${size}px ${FONT_D}`;
+    if ('letterSpacing' in g) g.letterSpacing = '6px';
+    const maxW = pos === 'center' ? W - 192 : sceneAt(t) ? 740 : W * 0.56;
+    const mw = g.measureText(text).width; if (mw > maxW) size = Math.floor(size * maxW / mw);
+    g.font = `800 ${size}px ${FONT_D}`;
+    const tw = g.measureText(text).width, x = pos === 'right' ? W - 96 - tw : pos === 'center' ? (W - tw) / 2 : 96;
+    const y = H * 0.42;
+    // soft dark band so the type reads over fog, windows and bright plates (blur = no hard box edges)
+    g.save(); g.filter = 'blur(28px)'; g.fillStyle = `rgba(0,0,0,${0.5 * a})`;
+    g.fillRect(x - 60, y - size * 0.6, tw + 120, size * 1.2 + 40); g.restore();
+    g.save();
+    g.translate(x + tw / 2 + shake, y); g.scale(scale, scale); g.translate(-tw / 2, 0);
+    g.textBaseline = 'middle';
+    if (slam && age < 0.4) {                                    // chromatic split on the slam
+      const sp = Math.exp(-age * 8) * 20;
+      g.fillStyle = alpha(C.alarm, a * 0.6); g.fillText(text, -sp, 0);
+      g.fillStyle = alpha(C.cool, a * 0.6); g.fillText(text, sp, 0);
+    }
+    g.fillStyle = alpha(C.type, a);
+    g.fillText(text, 0, 0);
+    g.fillStyle = alpha(C.cool, a); g.fillRect(0, size * 0.62, 120 * ease(age / 0.3), 4);
+    g.restore();
+    if ('letterSpacing' in g) g.letterSpacing = '0px';
+  }
+
+  function glue(t) {
+    // scanlines
+    g.fillStyle = 'rgba(0,0,0,0.10)';
+    for (let y = 0; y < H; y += 4) g.fillRect(0, y, W, 1);
+    // flash on strong onsets: < 3 frames, < 40%
+    const so = last(t, B.strong_onsets);
+    if (so.age < 0.08) { g.fillStyle = alpha(C.type, 0.35 * (1 - so.age / 0.08)); g.fillRect(0, 0, W, H); }
+    // iris wipe on section boundaries
+    const s = sectionAt(t), age = t - s.start;
+    if (s.start > 0 && age < 0.4) {
+      const r = ease(age / 0.4) * Math.hypot(W, H) / 2;
+      g.save(); g.strokeStyle = alpha(C.cool, 0.8 * (1 - age / 0.4)); g.lineWidth = 3;
+      g.beginPath(); g.arc(W / 2, H / 2, r, 0, Math.PI * 2); g.stroke(); g.restore();
+    }
+  }
+
+  // Music events: what the song DOES at a bar line, drawn on top of the beat-level glue.
+  //   drop        → flash (< 40%), shock ring, edge pulse; strength scales everything
+  //   break       → the frame hushes: a dark edge vignette for one bar while the bass is out
+  //   beat_change → a scan line sweeps the frame (down for half-time, up for double-time)
+  //   build       → edge ticks tighten toward the drop it leads into
+  //   hit_run     → (selected runs only) the frame strobes WITH the rapid cuts: see hitRun()
+  function music(t) {
+    hitRun(t);
+    const bar = 60 / B.bpm * 4;
+    const dr = lastEvent(t, 'drop');
+    if (dr.age < 0.6) {
+      const s = dr.e.strength, k = dr.age / 0.6;
+      g.fillStyle = alpha(C.type, 0.35 * s * clamp(1 - dr.age / 0.12)); g.fillRect(0, 0, W, H);
+      g.strokeStyle = alpha(C.cool, 0.8 * s * (1 - k)); g.lineWidth = 1 + 6 * (1 - k);
+      g.beginPath(); g.arc(W / 2, H / 2, 60 + ease(k) * Math.hypot(W, H) / 2, 0, Math.PI * 2); g.stroke();
+      if (dr.age < 0.4) {
+        const v = g.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.7);
+        v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, alpha(C.cool, 0.35 * s * (1 - dr.age / 0.4)));
+        g.fillStyle = v; g.fillRect(0, 0, W, H);
+      }
+    }
+    const br = lastEvent(t, 'break', 0.5);
+    if (br.age < bar && dr.e?.t !== br.e?.t) {
+      const h = Math.sin(Math.PI * clamp(br.age / bar)) * 0.45 * br.e.strength;
+      const v = g.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.65);
+      v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, `rgba(0,0,0,${h})`);
+      g.fillStyle = v; g.fillRect(0, 0, W, H);
+    }
+    const gc = lastEvent(t, 'beat_change', 0.3);
+    if (gc.age < 0.5) {
+      const k = ease(gc.age / 0.5), y = gc.e.dir === 'down' ? k * H : (1 - k) * H;
+      g.fillStyle = alpha(C.cool, 0.5 * (1 - k)); g.fillRect(0, y - 1, W, 2);
+      g.fillStyle = alpha(C.cool, 0.08 * (1 - k)); g.fillRect(0, gc.e.dir === 'down' ? 0 : y, W, gc.e.dir === 'down' ? y : H - y);
+    }
+    const bu = EV.find(e => e.kind === 'build' && t >= e.t && t < e.into);
+    if (bu) {
+      const k = (t - bu.t) / (bu.into - bu.t), n = 6 + Math.floor(k * 18);
+      g.strokeStyle = alpha(C.cool, 0.25 + 0.5 * k); g.lineWidth = 2;
+      for (let i = 0; i < n; i++) {
+        const x = (i + 0.5) / n * W;
+        g.beginPath(); g.moveTo(x, 0); g.lineTo(x, 10 + 20 * k); g.moveTo(x, H); g.lineTo(x, H - 10 - 20 * k); g.stroke();
+      }
+    }
+  }
+
+  // Rapid hard hits (selected hit_run events). Every hit: a 2-frame flash alternating white / accent, a strobing
+  // frame border, slice-glitch of the overlay, and a hit counter filling up. Reads as the machine "stuttering" in
+  // time with the drums. Only the few selected runs get this - on every fill it would stop being special.
+  function hitRun(t) {
+    const r = EV.find(e => e.kind === 'hit_run' && e.selected && t >= e.hits[0] - 0.01 && t < e.end + e.spacing + 0.2);
+    if (!r) return;
+    const h = last(t, r.hits); if (h.i < 0) return;
+    const n = r.hits.length, odd = h.i % 2 === 1, live = t < r.end + r.spacing;
+    const col = odd ? C.cool : C.type;
+    const fl = clamp(1 - h.age / 0.07);
+    if (fl > 0 && live) { g.fillStyle = alpha(col, 0.45 * fl); g.fillRect(0, 0, W, H); }
+    // strobing border, thicker on every second hit
+    const bw = (odd ? 14 : 6) * (live ? 1 : clamp(1 - (t - r.end - r.spacing) / 0.2));
+    g.strokeStyle = alpha(col, 0.9 * clamp(1 - h.age / 0.2) + 0.2); g.lineWidth = bw;
+    g.strokeRect(bw / 2 + 24, bw / 2 + 24, W - bw - 48, H - bw - 48);
+    // hit counter + chips
+    const cy = H * 0.78, x0 = W / 2 - n * 11;                // centred, clear of the corner HUD readouts
+    g.font = `700 26px ${FONT_M}`; g.textBaseline = 'top'; g.textAlign = 'center'; g.fillStyle = alpha(C.type, 0.9);
+    g.fillText(`HIT ${String(h.i + 1).padStart(2, '0')}/${String(n).padStart(2, '0')}`, W / 2, cy);
+    g.textAlign = 'left';
+    for (let i = 0; i < n; i++) {
+      g.fillStyle = alpha(i <= h.i ? col : C.dim, i <= h.i ? 0.95 : 0.6);
+      g.fillRect(x0 + i * 22, cy + 36, 16, 16);
+    }
+    // slice glitch of what is already drawn, for 2 frames per hit
+    if (h.age < 0.07 && live) {
+      g.save(); g.setTransform(1, 0, 0, 1, 0, 0);
+      for (let s = 0; s < 5; s++) {
+        const y = Math.floor(rand(h.i * 17 + s) * cv.height), hh = Math.floor((8 + rand(h.i * 5 + s) * 60) * DPR);
+        g.drawImage(cv, 0, y, cv.width, hh, Math.floor((rand(h.i * 3 + s) - 0.5) * 140 * DPR), y, cv.width, hh);
+      }
+      g.restore();
+    }
+  }
+
+  function introOutro(t) {
+    // intro: one line draws itself across black-ish frame
+    if (t < 4) {
+      const k = ease(t / 2.5);
+      g.strokeStyle = alpha(C.cool, 1); g.lineWidth = 2;
+      g.beginPath(); g.moveTo(W * 0.1, H / 2); g.lineTo(W * (0.1 + 0.8 * k), H / 2); g.stroke();
+    }
+    // outro fade handled by density; final word could be drawn here
+  }
+
+
+  // ---------- SCENES: lyric-driven graphics (take over from the HUD, then hand back) ----------
+  // Each scene is (t, k, s) → draws, k = fade envelope 0..1, s = {start, end, age, u} with u = progress 0..1.
+  // Keep each one a pure function of t like every layer. Default stage: the right half (lyric sits left).
+  // Ideas that worked (Agents in the Loop): people icons flipping into agents ("replacing…"), 1,000 dots dropping
+  // out with a counter ("workers fired"), a career bar burning to ash, a cost curve plunging to $0.00, a balance
+  // tipping to PROFIT, market vs society lines diverging, blast doors sliding shut, an ECG flatlining,
+  // a breaking economic loop diagram, lights in a grid going out, a segmented progress bar to 100%.
+  const RX = 1340, RY = 500;
+  const label = (txt, x, y, col, a, size = 18, align = 'left', font = FONT_M, weight = 600) => {
+    g.font = `${weight} ${size}px ${font}`; g.textAlign = align; g.textBaseline = 'alphabetic';
+    g.fillStyle = alpha(col, a); g.fillText(txt, x, y); g.textAlign = 'left';
+  };
+  const SCENES = {
+    // example: a big ring with agents racing around it (e.g. on the hook line)
+    loop(t, k, s) {
+      const r = 330;
+      g.strokeStyle = alpha(C.cool, 0.5 * k); g.lineWidth = 2; g.beginPath(); g.arc(RX, RY, r, 0, Math.PI * 2); g.stroke();
+      for (let i = 0; i < 24; i++) {
+        const a0 = hash(i, 1) * 6.283 + t * (1.2 + hash(i, 2) * 1.6);
+        for (let tr = 0; tr < 8; tr++) {
+          const a = a0 - tr * 0.05;
+          g.fillStyle = alpha(i % 6 === 0 ? C.warn : C.cool, k * (1 - tr / 8));
+          g.beginPath(); g.arc(RX + Math.cos(a) * r, RY + Math.sin(a) * r, 7 - tr * 0.6, 0, Math.PI * 2); g.fill();
+        }
+      }
+    },
+    // example: a segmented progress bar that fills over the scene ("complete", "finished", "loading")
+    progress(t, k, s) {
+      const p = ease(s.u * 1.25), n = 40;
+      for (let i = 0; i < n && !WORLD; i++) {               // with 3D on, world3d draws the ring; keep the label
+        g.fillStyle = alpha(i / n < p ? C.cool : C.dim, k * (i / n < p ? 1 : 0.4));
+        g.fillRect(140 + i * 41, 700, 33, 46);
+      }
+      label(`${Math.floor(p * 100)}%`, 140, 680, C.type, k, 22);
+    },
+  };
+  let SCN = [];
+  // scenes.json anchors: a number (s), a lyric phrase prefix ('#2' = 2nd occurrence, '+N' = N s after it),
+  // or for `to` also '+N' alone = N s after `from`.
+  function resolveScenes(def) {
+    const find = (spec) => {
+      if (typeof spec === 'number') return spec;
+      let [txt, plus] = String(spec).split('+'); let n = 1;
+      if (txt.includes('#')) { const [x, y] = txt.split('#'); txt = x; n = +y; }
+      const h = LYR.filter(l => l.text.toLowerCase().startsWith(txt.trim().toLowerCase()))[n - 1];
+      if (!h) { console.error('scene anchor not found:', spec); return null; }
+      return h.t + (plus ? +plus : 0);
+    };
+    SCN = [];
+    for (const d of (def?.scenes || [])) {
+      const a = find(d.from);
+      const b = typeof d.to === 'string' && d.to.startsWith('+') ? a + +d.to.slice(1) : find(d.to);
+      if (a == null || b == null || !(SCENES[d.scene] || WORLD?.has(d.scene))) continue;
+      SCN.push({ ...d, start: a - 0.05, end: b - 0.05 });
+    }
+  }
+  function sceneAt(t) {
+    for (const s of SCN) if (t >= s.start - 0.01 && t < s.end + 0.3) {
+      const k = ease((t - s.start) / 0.25) * (1 - easeIn((t - s.end) / 0.3));
+      return { s, k: clamp(k), u: clamp((t - s.start) / (s.end - s.start)), age: t - s.start };
+    }
+    return null;
+  }
+  function scene(t) {
+    const sc = sceneAt(t); if (!sc || sc.k <= 0 || !SCENES[sc.s.scene]) return;   // 3D-only scenes have no 2D part
+    SCENES[sc.s.scene](t, sc.k, { start: sc.s.start, end: sc.s.end, age: sc.age, u: sc.u });
+  }
+
+  // ---------- LAYERS: modular registry, drawn in this order ----------
+  // Each layer is an independent function (t, d) → draws. Fix or restyle one layer without touching the others.
+  // Per-cut control lives in storyboard.json as data, so most fixes need no code change:
+  //   "overlay": {"hide": ["gimbal"], "only": ["lyric","glue"], "density": 0.2}
+  // Debug one layer in isolation: overlay.html?layers=ribbon,lyric  (or render_overlay.mjs --layers ribbon,lyric)
+  // ---------- PLATE AWARENESS (plate_features.py) ----------
+  // The graphics draw WITH the picture: each plate's straight edges, vanishing point, the performer's silhouette
+  // + joints, structural contours and bright spots, mapped through exactly the transform assemble.py applies to
+  // the cut (cover-crop, Ken Burns zoom/drift, crop, hflip; video: cover + crop, time = offset + age).
+  // plateFX draws: lock-on brackets + head reticle + an outline scan (drops) + text running along her contour;
+  // perspective guides and a floor grid out of the real vanishing point; scans along real edges; reticles on
+  // lights; text along the main contour of empty shots. Per song: change the strings and the colours.
+  // VIDEO plates are tracked: plate_features.py samples every 0.2 s, fills/smooths the person offline and tracks
+  // contours/lines with optical flow (ids in cids/lids). sampleAt() interpolates between samples (Catmull-Rom for
+  // the box, face and joints, point-wise lerp for the silhouette and tracked contours), never across a cut inside
+  // the clip, so brackets, the face reticle and contour traces ride the moving picture. Pure function of t.
+  let FEAT = {};
+  const lerpA = (a, b, f) => a.map((v, i) => v + (b[i] - v) * f);
+  const crA = (p0, p1, p2, p3, f) => p1.map((v, i) => { const a = p0[i], c = p2[i], d = p3[i];
+    return v + 0.5 * f * (c - a + f * (2 * a - 5 * v + 4 * c - d + f * (3 * (v - c) + d - a))); });
+  const segOf = s => s.seg || 0;
+  function sampleAt(F, st) {
+    const S = F.samples; if (S.length < 2) return { ...S[0], pA: 1 };
+    let i = 0; while (i < S.length - 2 && S[i + 1].t <= st) i++;
+    const a = S[i], b = S[i + 1];
+    if (segOf(a) !== segOf(b)) return { ...(st < b.t ? a : b), pA: 1 };      // hard cut inside the clip
+    const f = clamp((st - a.t) / Math.max(1e-6, b.t - a.t));
+    const p0 = i > 0 && segOf(S[i - 1]) === segOf(a) ? S[i - 1] : a, p3 = i + 2 < S.length && segOf(S[i + 2]) === segOf(b) ? S[i + 2] : b;
+    const pa = a.person, pb = b.person;
+    let person = pa || pb, pA = pa && pb ? 1 : pa ? 1 - f : f;                  // detection gap: fade, don't pop
+    if (pa && pb) {
+      const cr = (A, B, k0, k3) => A && B ? crA(k0 || A, A, B, k3 || B, f) : (f < 0.5 ? A : B);
+      const joints = {};
+      for (const k in pa.joints) if (pb.joints[k]) joints[k] = cr(pa.joints[k], pb.joints[k], p0.person?.joints?.[k], p3.person?.joints?.[k]);
+      person = { ...pa, joints, bbox: cr(pa.bbox, pb.bbox, p0.person?.bbox, p3.person?.bbox), face: cr(pa.face, pb.face, p0.person?.face, p3.person?.face),
+        poly: pa.poly && pb.poly && pa.poly.length === pb.poly.length ? pa.poly.map((q, j) => lerpA(q, pb.poly[j], f)) : (f < 0.5 ? pa.poly : pb.poly) };
+    }
+    const track = (A, Aid, Bl, Bid) => {                       // lerp tracked items that share an id; fade the rest
+      const m = {}; (Bid || []).forEach((id, j) => m[id] = Bl[j]);
+      const out = [], ids = [], al = [], aid = Aid || A.map((_, j) => j);
+      A.forEach((c, j) => { const d = m[aid[j]]; out.push(d && d.length === c.length ? (typeof c[0] === 'number' ? lerpA(c, d, f) : c.map((q, k) => lerpA(q, d[k], f))) : c); ids.push(aid[j]); al.push(d ? 1 : 1 - f); });
+      (Bid || []).forEach((id, j) => { if (!aid.includes(id)) { out.push(Bl[j]); ids.push(id); al.push(f); } });
+      return [out, ids, al];
+    };
+    const [contours, cids, calpha] = track(a.contours, a.cids, b.contours, b.cids);
+    const [lines, lids] = track(a.lines, a.lids, b.lines, b.lids);
+    const vp = a.vp && b.vp ? { ...a.vp, x: lerp(a.vp.x, b.vp.x, f), y: lerp(a.vp.y, b.vp.y, f) } : a.vp;
+    return { t: st, person, pA, contours, cids, calpha, lines: lines.slice(0, a.lines.length), lids, vp, bright: a.bright };
+  }
+  // The contour a cut follows: the tracked edge alive at the cut's first frame that lasts longest into the cut.
+  function cutContour(c, F) {
+    if (F.kind !== 'video' || !F.tracks) return null;
+    const st0 = (c.offset || 0) % (F.duration || 8), st1 = st0 + (c.end - c.start);
+    let best = null, bl = 0.4;
+    for (const [id, [t0, t1]] of Object.entries(F.tracks.contours || {}))
+      if (t0 <= st0 + 0.05 && t1 > st0) { const L = Math.min(t1, st1) - st0; if (L > bl) { bl = L; best = +id; } }
+    return best;
+  }
+  const KB = { 'kenburns-in': [1, 1.12], 'kenburns-out': [1.12, 1] };
+  function plateAt(t) {
+    const c = cutAt(t); if (!c || !c.source || !FEAT[c.source]) return null;
+    const F = FEAT[c.source], OW = SB.width || W, OH = SB.height || H, k = W / OW, iw = F.w, ih = F.h;
+    const u = clamp((t - c.start) / Math.max(0.01, c.end - c.start));
+    let map, smp = { ...F.samples[0], pA: 1 };
+    if (F.kind === 'image') {
+      const [z0, z1] = KB[c.motion] || [1.06, 1.06], z = (z0 + (z1 - z0) * u) * (c.crop || 1);
+      const dx = c.motion === 'drift-left' ? 1 : c.motion === 'drift-right' ? -1 : 0;
+      const s = Math.max(OW / iw, OH / ih), ox = (iw * s - OW) / 2, oy = (ih * s - OH) / 2;
+      const x0 = OW / 2 - OW / z / 2 + dx * u * OW * 0.04, y0 = OH / 2 - OH / z / 2;
+      map = (nx, ny) => { let qx = nx * iw * s - ox; if (c.hflip) qx = OW - qx; return [(qx - x0) * z * k, (ny * ih * s - oy - y0) * z * k]; };
+    } else {
+      const s = Math.max(OW * (c.crop || 1) / iw, OH * (c.crop || 1) / ih), ox = (iw * s - OW) / 2, oy = (ih * s - OH) / 2;
+      map = (nx, ny) => { let x = nx * iw * s - ox; if (c.hflip) x = OW - x; return [x * k, (ny * ih * s - oy) * k]; };
+      const st = ((c.offset || 0) + (t - c.start)) % (F.duration || 8);
+      smp = sampleAt(F, st);
+    }
+    return { c, F, s: smp, map, age: t - c.start, u };
+  }
+  const inLyricBand = (x, y) => y > H * 0.42 - 120 && y < H * 0.42 + 110 && x < W * 0.6;   // where the lyric sits
+  function textOnPath(pts, text, offset, size, col, a, closed = true, skip = inLyricBand) {
+    if (!pts || pts.length < 3) return;
+    const P = closed ? [...pts, pts[0]] : pts, L = [0];
+    for (let i = 1; i < P.length; i++) L.push(L[i - 1] + Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]));
+    const total = L[L.length - 1]; if (total < 50) return;
+    g.font = `600 ${size}px ${FONT_M}`; g.textBaseline = 'middle'; g.fillStyle = alpha(col, a);
+    let d = ((offset % total) + total) % total, used = 0, ci = 0, seg = 0;
+    while (used < total - size) {
+      const ch = text[ci++ % text.length], w = g.measureText(ch).width + 1, m = (d + w / 2) % total;
+      while (seg > 0 && L[seg] > m) seg--;
+      while (seg < L.length - 2 && L[seg + 1] < m) seg++;
+      const a0 = P[seg], a1 = P[seg + 1], f = (m - L[seg]) / Math.max(1e-6, L[seg + 1] - L[seg]);
+      const x = lerp(a0[0], a1[0], f), y = lerp(a0[1], a1[1], f);
+      if (ch !== ' ' && !skip(x, y)) { g.save(); g.translate(x, y); g.rotate(Math.atan2(a1[1] - a0[1], a1[0] - a0[0])); g.fillText(ch, -w / 2, 0); g.restore(); }
+      d = (d + w) % total; used += w; if (d < w) seg = 0;
+    }
+  }
+  // Contour budget: contour work is an accent, not wallpaper. Per cut (deterministic by its start time):
+  // ~45% nothing, ~35% one animated TRACE (the outline draws itself on, holds faint, a bright scan runs around it
+  // on drops), ~20% of the longer cuts TEXT along the contour. Flash cuts get nothing.
+  function contourMode(c) {
+    if (!c || c.flash) return 'none';
+    const h = hash(Math.round(c.start * 10), 17);
+    return (c.end - c.start >= 2.4 && h < 0.2) ? 'text' : h < 0.55 ? 'trace' : 'none';
+  }
+  const polyLen = (P, closed) => { let L = 0; for (let i = 1; i < P.length; i++) L += Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]);
+    return closed && P.length > 1 ? L + Math.hypot(P[0][0] - P[P.length - 1][0], P[0][1] - P[P.length - 1][1]) : L; };
+  function traceContour(P, closed, age, dAge, col, A) {
+    if (!P || P.length < 3) return;
+    const total = polyLen(P, closed), on = ease(age / 0.9);
+    g.save(); g.lineJoin = 'round'; g.lineCap = 'round';
+    g.beginPath(); P.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); if (closed) g.closePath();
+    g.setLineDash([total * on, total]);                        // draw-on
+    g.strokeStyle = alpha(col, (0.75 - 0.55 * on) * A + 0.12 * A); g.lineWidth = 2; g.stroke();
+    if (on < 1) {                                              // bright head of the drawing line
+      g.setLineDash([24, total]); g.lineDashOffset = -(total * on - 24);
+      g.strokeStyle = alpha(C.type, A); g.lineWidth = 3.5; g.shadowColor = col; g.shadowBlur = 16; g.stroke();
+    } else if (dAge < 0.9) {                                   // drop: one bright scan around the outline
+      g.setLineDash([140, total]); g.lineDashOffset = -(dAge / 0.9) * total;
+      g.strokeStyle = alpha(C.type, (1 - dAge / 0.9) * A); g.lineWidth = 3.5; g.shadowColor = col; g.shadowBlur = 16; g.stroke();
+    }
+    g.restore();
+  }
+  function plateFX(t, dd) {
+    const p = plateAt(t); if (!p) return;
+    const s = p.s, sk = sceneAt(t)?.k || 0, A = ease((t - 2) / 1.5) * ease(p.age / 0.3) * (1 - 0.6 * sk);
+    if (A <= 0.01) return;
+    const beat = last(t, B.beats), beatK = Math.exp(-beat.age * 7), dr = lastEvent(t, 'drop'), acc = C.cool, mode = contourMode(p.c);
+    const pts = arr => arr.map(([x, y]) => p.map(x, y));
+    const person = s.person && s.person.bbox ? s.person : null;
+    if (person) {
+      const PA = A * s.pA, [bx, by, bw, bh] = person.bbox, a = p.map(bx, by), b = p.map(bx + bw, by + bh);
+      const pad = 22 + 80 * (1 - ease(p.age / 0.45)), X0 = Math.min(a[0], b[0]) - pad, X1 = Math.max(a[0], b[0]) + pad;
+      const Y0 = a[1] - pad, Y1 = Math.min(b[1] + pad, H - 40);
+      g.strokeStyle = alpha(acc, 0.8 * PA); g.lineWidth = 2;
+      const br = (x, y, sx, sy) => { g.beginPath(); g.moveTo(x, y + sy * 36); g.lineTo(x, y); g.lineTo(x + sx * 36, y); g.stroke(); };
+      br(X0, Y0, 1, 1); br(X1, Y0, -1, 1); br(X0, Y1, 1, -1); br(X1, Y1, -1, -1);
+      if (person.poly) {
+        const poly = pts(person.poly);
+        if (mode === 'trace') traceContour(poly, true, p.age, dr.age, acc, PA);
+        if (mode === 'text') textOnPath(poly, 'SUBJECT · HUMAN · IN THE LOOP · ', t * 45, 13, C.type, 0.5 * PA);
+      }
+      // face reticle: centred on the (tracked) face box, sized by it; falls back to the head joint, then the box top
+      const fb = person.face, fc = fb ? p.map(fb[0] + fb[2] / 2, fb[1] + fb[3] / 2) : person.joints?.head ? p.map(...person.joints.head) : p.map(bx + bw / 2, by + bh * 0.08);
+      if (fc) {
+        const fh = fb ? Math.abs(p.map(fb[0], fb[1] + fb[3])[1] - p.map(fb[0], fb[1])[1]) : 0;
+        const r = Math.max(26, 0.75 * fh) + 5 * beatK, side = fc[0] > W * 0.7 ? -1 : 1;
+        g.strokeStyle = alpha(acc, 0.85 * PA); g.lineWidth = 2;
+        g.beginPath(); g.arc(fc[0], fc[1], r, 0, Math.PI * 2); g.stroke();
+        const up = fc[1] - r > H * 0.24 ? -1 : 1, ly = fc[1] + up * (r + 12);   // label under the face when the top HUD rows are above it
+        g.beginPath(); g.moveTo(fc[0] + side * r * 0.72, fc[1] + up * r * 0.72); g.lineTo(fc[0] + side * (r + 16), ly); g.lineTo(fc[0] + side * (r + 60), ly); g.stroke();
+        g.font = `600 15px ${FONT_M}`; g.fillStyle = alpha(C.type, 0.85 * PA); g.textAlign = side > 0 ? 'left' : 'right';
+        g.fillText('SUBJECT 01', fc[0] + side * (r + 20), ly + (up < 0 ? -8 : 22)); g.textAlign = 'left';
+      }
+      return;
+    }
+    const vp = s.vp && s.vp.conf >= 0.3 ? s.vp : null;
+    if (vp) {
+      const V = p.map(vp.x, vp.y), grow = ease(p.age / 0.7);
+      g.lineWidth = 1.3;
+      vp.lines.slice(0, 5).forEach((i, n) => {
+        const l = s.lines[i]; if (!l) return;
+        const e1 = p.map(l[0], l[1]), e2 = p.map(l[2], l[3]);
+        const far = Math.hypot(e1[0] - V[0], e1[1] - V[1]) > Math.hypot(e2[0] - V[0], e2[1] - V[1]) ? e1 : e2;
+        g.strokeStyle = alpha(n === 0 ? C.warn : acc, (0.3 + 0.2 * beatK) * A);
+        g.beginPath(); g.moveTo(V[0], V[1]); g.lineTo(V[0] + (far[0] - V[0]) * 2.2 * grow, V[1] + (far[1] - V[1]) * 2.2 * grow); g.stroke();
+      });
+    }
+    if (!vp && s.contours.length && mode !== 'none') {
+      // video: follow one tracked edge for the whole cut (it moves with the camera); still: the main contour
+      const id = cutContour(p.c, p.F), j = id == null ? (p.F.kind === 'video' ? -1 : 0) : (s.cids || []).indexOf(id);
+      if (j >= 0) {
+        const c0 = pts(s.contours[j]), ca = A * (s.calpha ? s.calpha[j] : 1);
+        if (mode === 'trace') traceContour(c0, false, p.age, dr.age, acc, ca);
+        else textOnPath(c0, 'agent › optimizing · uptime 99.999% · ', t * 40, 12, C.type, 0.5 * ca, false);
+      }
+    }
+    s.bright.slice(0, 2).forEach((b, i) => {
+      const q = p.map(b[0], b[1]); if (inLyricBand(...q)) return;
+      g.save(); g.translate(q[0], q[1]); g.rotate(Math.PI / 4 + t * 0.6); g.strokeStyle = alpha(i ? C.warn : acc, 0.8 * A);
+      g.lineWidth = 1.5; g.strokeRect(-9, -9, 18, 18); g.restore();
+    });
+  }
+
+  // ---------- 3D LAYER (world3d.js): line graphics + panels ----------
+  // world3d draws LINES and DOTS in 3D (line ribbons, wire floor, dot swarm, wireframe scenes: fired,
+  // crash, progress, won - deliberately no hero sphere/object) and PANELS: the scene stage and the HUD are drawn into
+  // offscreen canvases and shown on planes that sit flat (= drawn directly, pixel-exact 2D) or swing/tilt in 3D.
+  // Balance: lyrics/titles/FX always flat 2D; stage + HUD shift between 2D and 3D on cues; the rest is native 3D.
+  // direct3d(t) and panelPose(t) are the director: adapt the story per song.
+  let WORLD = null, GLCV = null;
+  const GL_OFF = qs.get('gl') === 'off', GL_SCALE = +(qs.get('glscale') || 1);
+  const STAGE = { x: 960, y: 120, w: 880, h: 820 };          // where 3D lyric scenes play (right half, like 2D scenes)
+  const PANEL_OF = { hud: 'hud', scene: 'stage' };
+  const PANEL_PIVOT = { stage: { x: STAGE.x + STAGE.w / 2, y: STAGE.y + STAGE.h / 2 }, hud: { x: W / 2, y: 120 } };
+  const PCV = {}, PG = {};
+  async function initWorld() {
+    if (GL_OFF) return;
+    const m = window.__three || await new Promise(res => {
+      addEventListener('three-ready', () => res(window.__three), { once: true }); setTimeout(() => res(null), 5000); });
+    if (!m) { console.warn('3D layer unavailable, 2D only'); return; }
+    for (const n of ['stage', 'hud']) {
+      PCV[n] = document.createElement('canvas'); PCV[n].width = Math.round(W * DPR); PCV[n].height = Math.round(H * DPR);
+      PG[n] = PCV[n].getContext('2d');
+    }
+    GLCV = document.getElementById('gl');
+    WORLD = m.createWorld3D({ THREE: m.THREE, LINES: m.LINES, canvas: GLCV, W, H, DPR, scale: GL_SCALE, palette: C, panels: PCV,
+      layout: { stage: STAGE, ribbonY: H * 0.7, floor: { y: H * 0.86 }, swarmR: H * 0.42, swarmCenter: { x: W * 0.72, y: H * 0.45, r: 170 } } });
+    window.__gl3d = WORLD.renderer;                           // render_overlay.mjs prints it (GPU or SwiftShader)
+  }
+  function musicState(t) {
+    const bar = 60 / B.bpm * 4, dr = lastEvent(t, 'drop'), br = lastEvent(t, 'break', 0.5);
+    const hr = EV.find(e => e.kind === 'hit_run' && e.selected && t >= e.hits[0] && t < e.end + e.spacing + 0.6);
+    return { bar, dAge: dr.age, dS: dr.e ? dr.e.strength : 0, calm: br.e && br.age < bar ? Math.sin(Math.PI * br.age / bar) * br.e.strength : 0,
+             hit: hr ? last(t, hr.hits) : null, hitLive: hr ? t < hr.end + hr.spacing : false, hitAfter: hr ? t - (hr.end + hr.spacing) : 0,
+             bu: EV.find(e => e.kind === 'build' && t >= e.t && t < e.into), beat: last(t, B.beats) };
+  }
+  function panelPose(t, name, M) {                            // 2D -> 3D shift cues (all zero = plain 2D)
+    const side = name === 'hud' ? -1 : 1, hot = sectionAt(t).label === 'high' ? 1 : 0;
+    let rx = 0, ry = 0, z = 0;
+    ry += hot * 0.14 * Math.sin(t * 0.45 + side); rx += hot * 0.06 * Math.sin(t * 0.33 + side * 2);   // loud sections drift
+    if (M.dAge < 1.6) ry += side * M.dS * 0.45 * Math.exp(-M.dAge * 3.5) * Math.cos(M.dAge * 11);     // drop kick
+    if (M.hit) { const k = M.hitLive ? 1 : 1 - ease(M.hitAfter / 0.5);
+      ry += k * (hash(M.hit.i, side * 3) - 0.5) * 0.8; rx += k * (hash(M.hit.i, side * 5) - 0.5) * 0.35; }      // hit-run snaps
+    if (name === 'stage') { const sc = sceneAt(t);                                                        // scenes swing in/out
+      if (sc) { ry += 1.1 * (1 - ease(sc.age / 0.55)); ry -= 1.1 * ease((t - sc.s.end) / 0.3); z -= 1.5 * (1 - ease(sc.age / 0.55)); } }
+    const still = 1 - M.calm;                                                                             // breaks: flat and still
+    return { rx: rx * still, ry: ry * still, z: z * still, px: PANEL_PIVOT[name].x, py: PANEL_PIVOT[name].y };
+  }
+  function direct3d(t) {
+    const M = musicState(t), sc = sceneAt(t), has3 = sc && WORLD.has(sc.s.scene), sk = sc ? sc.k : 0;
+    const L = loud(t), story = t / B.duration, red = sectionAt(t).label === 'high' ? 0.5 : 0;
+    const on = ease((t - 2) / 1.5) * (1 - ease((t - (B.duration - 3)) / 2));
+    const lockK = sc && sc.s.scene === 'loop' ? sc.k : 0, engulf = sc && sc.s.scene === 'won' ? sc.k * ease(sc.u * 1.3) : 0;
+    return {
+      t, loud: L, doom: story, red,
+      swarm: { density: on * (0.15 + 0.7 * story) * (1 - 0.5 * sk + 0.5 * (lockK + engulf)), lock: lockK, engulf, opacity: 0.75 },
+      ribbon: { on: on * 0.8 * (1 - 0.5 * sk) },
+      floor: { on: on * 0.45 * (1 - 0.4 * sk) * (plateAt(t)?.s.vp?.conf >= 0.3 ? 0 : 1), ripple: { age: M.dAge, s: M.dS }, collapse: 0, tilt: 0 },
+      cam: { shake: M.dS * Math.exp(-M.dAge * 8) + (M.hit && M.hitLive ? 0.5 * Math.exp(-M.hit.age * 12) : 0),
+             push: M.bu ? 2.5 * ease((t - M.bu.t) / (M.bu.into - M.bu.t)) : 0 },
+      scene: has3 ? { name: sc.s.scene, k: sc.k, u: sc.u, age: sc.age } : null,
+      panels: { stage: panelPose(t, 'stage', M), hud: panelPose(t, 'hud', M) },
+    };
+  }
+  function world3d(t) {
+    if (!WORLD) return;
+    const { flat } = WORLD.seek(direct3d(t));
+    g.drawImage(GLCV, 0, 0, W, H);
+    for (const n of Object.keys(PCV)) if (flat[n]) g.drawImage(PCV[n], 0, 0, W, H);   // flat panels: plain 2D
+  }
+
+  const LAYERS = {
+    world3d,                                                  // 3D first (incl. the panels): the 2D layers sit on top
+    plateFX,                                                  // graphics that follow the picture
+    ribbon,
+    gimbal,
+    tickRail,
+    hud,
+    scene: (t) => scene(t),
+    lyric: (t) => lyric(t),
+    music: (t) => music(t),
+    introOutro: (t) => introOutro(t),
+    glue: (t) => glue(t),
+  };
+  const urlLayers = qs.get('layers') ? qs.get('layers').split(',') : null;
+
+  // ---------- seek(t): the only entry point ----------
+  // base HUD layers that step back while a lyric scene is active (the ribbon stays faintly)
+  const HUD_LAYERS = new Set(['ribbon', 'gimbal', 'tickRail', 'hud']);
+  window.seek = (t) => {
+    const main = g;
+    g.setTransform(DPR, 0, 0, DPR, 0, 0);
+    g.clearRect(0, 0, W, H);
+    for (const n of Object.keys(PG)) { PG[n].setTransform(DPR, 0, 0, DPR, 0, 0); PG[n].clearRect(0, 0, W, H); }
+    // global build/teardown: parts assemble over the first bars and come apart in the last 4 s
+    const build = ease((t - 1.5) / 4), teardown = 1 - ease((t - (B.duration - 4)) / 3);
+    const o = cutAt(t)?.overlay || {};
+    const d = (o.density ?? density(t)) * build * teardown;
+    const run = (name, fn) => {
+      if (urlLayers && !urlLayers.includes(name)) return;
+      if (o.only && !o.only.includes(name)) return;
+      if (o.hide && o.hide.includes(name)) return;
+      const sk = HUD_LAYERS.has(name) ? (sceneAt(t)?.k || 0) : 0;
+      const dd = d * (1 - sk * (name === 'ribbon' ? 0.6 : 1));
+      if (HUD_LAYERS.has(name) && dd <= 0.001) return;
+      g.save(); fn(t, dd); g.restore();
+    };
+    // pass 1: panel layers draw into their offscreen canvases; pass 2: the rest on the main canvas, world3d first
+    if (WORLD) for (const [name, fn] of Object.entries(LAYERS)) if (PANEL_OF[name]) { g = PG[PANEL_OF[name]]; run(name, fn); g = main; }
+    for (const [name, fn] of Object.entries(LAYERS)) if (!WORLD || !PANEL_OF[name]) run(name, fn);
+    return true;
+  };
+
+  // ---------- data loading ----------
+  async function load() {
+    if (window.__DATA__) {
+      const D = window.__DATA__;
+      if (D.beats) B = D.beats; if (D.lyrics) LYR = D.lyrics; if (D.storyboard) SB = D.storyboard; if (D.features) FEAT = D.features;
+      if (D.scenes) window.__SCN = D.scenes;
+    } else {
+      const get = async (u) => { try { const r = await fetch(u); return r.ok ? r.json() : null; } catch { return null; } };
+      B = (await get(qs.get('beats') || '../audio-analysis/beats.json')) || B;
+      LYR = (await get(qs.get('lyrics') || 'lyrics.json')) || LYR;
+      SB = await get(qs.get('storyboard') || '../../video/storyboard.json');
+      window.__SCN = await get(qs.get('scenes') || 'scenes.json');
+    }
+    LYR = LYR.map(l => ({ ...l, t: l.t ?? l.start })).sort((a, b) => a.t - b.t);
+    EV = (SB?.markers?.drops || []).slice().sort((a, b) => a.t - b.t);
+    await initWorld();
+    resolveScenes(window.__SCN);
+    await document.fonts.ready;
+  }
+  window.ready = load().then(() => { window.seek(0); return true; });
+
+  // live preview only (never used by the renderer): plays the timeline with the wall clock
+  if (qs.get('preview')) window.ready.then(() => {
+    const t0 = performance.now() / 1000 - (+qs.get('t') || 0);
+    const loop = () => { window.seek((performance.now() / 1000 - t0) % B.duration); requestAnimationFrame(loop); };
+    loop();
+  });
+})();
+</script>
+</body>
+</html>
