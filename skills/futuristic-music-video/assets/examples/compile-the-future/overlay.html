@@ -1,0 +1,1469 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>overlay</title>
+<!--
+  Machine-layer overlay. A pure function of time: window.seek(t) draws song-time t.
+  Contract: no timers, no Date.now/performance.now, no requestAnimationFrame, no CSS transitions,
+  no unseeded Math.random. Transparent background; assembly composites it over plates.
+
+  Data comes from window.__DATA__ = {beats, lyrics, storyboard} injected by render_overlay.mjs.
+  For a live browser preview, serve the project root (npx serve .) and open
+  /assets/overlay/overlay.html?preview=1 — it fetches the default paths below and plays the timeline.
+
+  Customise per video: TOKENS (from the bible), the VOCAB section, lyric styling, and SCENES.
+  4K: layout is authored in 1920x1080 CSS px; the canvas backing store is devicePixelRatio-scaled, so
+  `render_overlay.mjs --scale 2` gives crisp 3840x2160 frames with no layout changes.
+  Scenes: lyric-driven graphics that take over from the HUD for specific lines, then hand back to it.
+  When = assets/overlay/scenes.json (anchored to lyric phrases), what = the SCENES functions below.
+  A HUD that is on screen the whole song gets boring; aim for a scene on most lyric lines that have a concrete image.
+-->
+<style>
+  @font-face { font-family: "Big Shoulders Display"; src: url("fonts/BigShouldersDisplay.ttf"); font-weight: 100 900; }
+  @font-face { font-family: "Share Tech Mono"; src: url("fonts/ShareTechMono-Regular.ttf"); }
+  /* Compile the Future: NOIR SIGNAL tokens (video/bible.md). Green is reserved for the BUILD's green check. */
+  :root {
+    --bg:     #07090C;
+    --cool:   #3EF0FF;
+    --accent2:#FF3EA5;
+    --warn:   #FFB25A;
+    --signal: #39FF6A;
+    --type:   #EDEFF2;
+    --dim:    #3A4650;
+    --font-display: "Big Shoulders Display", "Arial Narrow", sans-serif;
+    --font-mono: "Share Tech Mono", Menlo, monospace;
+  }
+  html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; background: transparent; }
+  body.green { background: #00FF00; }
+  canvas { display: block; width: 1920px; height: 1080px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<canvas id="gl" style="display:none"></canvas>
+<!-- 3D layer (optional): three.js + world3d.js, served from disk by render_overlay.mjs (http://overlay.local).
+     Copy $SKILL/assets/world3d.js next to this file. ?gl=off or a missing module -> 2D only. -->
+<script type="importmap">{"imports": {"three": "/__three/three.module.js", "three/addons/": "/__three_addons/"}}</script>
+<script type="module">
+  import * as THREE from 'three';
+  import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+  import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+  import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+  import { createWorld3D } from './world3d.js';
+  window.__three = { THREE, LINES: { LineSegments2, LineSegmentsGeometry, LineMaterial }, createWorld3D };
+  window.dispatchEvent(new Event('three-ready'));
+</script>
+<script>
+(() => {
+  const W = 1920, H = 1080;
+  const cv = document.getElementById('c');
+  const DPR = window.devicePixelRatio || 1;                  // 2 with render_overlay.mjs --scale 2
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  let g = cv.getContext('2d');                         // let: panel layers draw into offscreen canvases (see seek)
+  const qs = new URLSearchParams(location.search);
+  if (qs.get('bg') === 'green') document.body.classList.add('green');
+
+  // ---------- tokens (keep names; values come from the bible) ----------
+  const css = getComputedStyle(document.documentElement);
+  const T = k => css.getPropertyValue(k).trim();
+  const C = { bg: T('--bg'), cool: T('--cool'), mag: T('--accent2'), warn: T('--warn'), signal: T('--signal'),
+              type: T('--type'), dim: T('--dim') };
+  C.alarm = C.mag;                                            // "failure" colour in this palette = magenta
+  const FONT_D = T('--font-display'), FONT_M = T('--font-mono');
+
+  // ---------- deterministic helpers ----------
+  const hash = (i, s = 0) => { let x = Math.sin(i * 127.1 + s * 311.7) * 43758.5453; return x - Math.floor(x); };
+  const rand = (seed) => hash(seed, 7.3);                     // seeded 0..1
+  const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+  const lerp = (a, b, k) => a + (b - a) * k;
+  const ease = k => 1 - Math.pow(1 - clamp(k), 4);            // ~cubic-bezier(.16,1,.3,1)
+  const easeIn = k => Math.pow(clamp(k), 3);                  // for faster exits
+  const spring = (age, w = 18, z = 0.45) =>                   // closed-form damped spring 0→1
+    age <= 0 ? 0 : 1 - Math.exp(-z * w * age) * Math.cos(w * Math.sqrt(1 - z * z) * age);
+  const alpha = (hex, a) => {
+    const n = parseInt(hex.replace('#', ''), 16);
+    return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${clamp(a)})`;
+  };
+  // last event at or before t in a sorted array → {i, time, age}
+  function last(t, arr) {
+    let lo = 0, hi = arr.length - 1, i = -1;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (arr[m] <= t) { i = m; lo = m + 1; } else hi = m - 1; }
+    return i < 0 ? { i: -1, time: -1e9, age: 1e9 } : { i, time: arr[i], age: t - arr[i] };
+  }
+
+  // ---------- data ----------
+  let B = { duration: 60, bpm: 120, fps: 30, beats: [], downbeats: [], onsets: [], strong_onsets: [], loudness: [], sections: [] };
+  let LYR = [];      // [{t, text, end?}]
+  let SB = null;     // storyboard {cuts:[...]}
+  // Music events from scripts/drops.py, passed through storyboard.markers.drops: [{t, kind, strength, dir?}]
+  // kind: drop | break | beat_change | build. The storyboard already cuts on them; the overlay hits them too.
+  let EV = [];
+  const eventNear = (t0, kind, win, minS = 0.3) =>
+    EV.find(e => e.kind === kind && e.strength >= minS && Math.abs(e.t - t0) <= win) || null;
+  const lastEvent = (t, kind, minS = 0.3) => {                 // most recent event of a kind → {e, age}
+    let r = null; for (const e of EV) if (e.kind === kind && e.strength >= minS && e.t <= t) r = e;
+    return r ? { e: r, age: t - r.t } : { e: null, age: 1e9 };
+  };
+  const loud = t => {
+    const L = B.loudness; if (!L.length) return 0.5;
+    const f = t * B.fps, i = Math.floor(f), k = f - i;
+    return lerp(L[clamp(i, 0, L.length - 1)], L[clamp(i + 1, 0, L.length - 1)], k);
+  };
+  const sectionAt = t => B.sections.find(s => t >= s.start && t < s.end) || { label: 'mid', start: 0, end: B.duration };
+  const cutAt = t => SB ? SB.cuts.find(c => t >= c.start && t < c.end) || null : null;
+  // How much machine to show: full HUD on verses/machine rows, thin on chorus plates.
+  const density = t => {
+    const c = cutAt(t);
+    if (c) return c.layer === 'plate' && !c.pip ? (c.section === 'chorus' ? 0.3 : 0.55) : 1;
+    return sectionAt(t).label === 'high' ? 0.45 : 1;
+  };
+
+  // ---------- VOCAB: the machine parts ----------
+  function ribbon(t, d) {
+    if (WORLD) return;                                   // the 3D layer draws silk ribbons instead
+    const L = loud(t), strands = 7, y0 = H * 0.68;
+    g.lineCap = 'round';
+    for (let s = 0; s < strands; s++) {
+      const ph = s * 0.9, amp = (30 + 140 * L) * (0.6 + 0.4 * Math.sin(t * 0.7 + s));
+      g.beginPath();
+      for (let x = -20; x <= W + 20; x += 16) {
+        const u = x / W;
+        const y = y0 + Math.sin(u * 6.0 + t * 1.3 + ph) * amp * 0.6
+                     + Math.sin(u * 13.0 - t * 2.1 + ph * 2) * amp * 0.25
+                     + Math.sin(u * 2.0 + t * 0.4) * 40 + (s - strands / 2) * (4 + 10 * L);
+        x === -20 ? g.moveTo(x, y) : g.lineTo(x, y);
+      }
+      const hot = s === 3;
+      g.strokeStyle = alpha(hot && L > 0.8 ? C.warn : C.cool, (hot ? 0.9 : 0.25 + 0.1 * s / strands) * d);
+      g.lineWidth = hot ? 1.5 + 5 * L : 1;
+      g.stroke();
+    }
+  }
+
+  function tickRail(t, d) {
+    const y = H - 70, span = 8, px = W / span; // 8 s visible, playhead at centre
+    g.strokeStyle = alpha(C.dim, 0.9 * d); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(96, y); g.lineTo(W - 96, y); g.stroke();
+    const draw = (arr, h, col, a) => {
+      for (const b of arr) {
+        const x = W / 2 + (b - t) * px; if (x < 96 || x > W - 96) continue;
+        const near = Math.exp(-Math.abs(b - t) * 8);
+        g.strokeStyle = alpha(col, (a + near) * d);
+        g.beginPath(); g.moveTo(x, y - h - 10 * near); g.lineTo(x, y); g.stroke();
+      }
+    };
+    draw(B.beats, 8, C.dim, 0.6); draw(B.downbeats, 22, C.cool, 0.5);
+    g.fillStyle = alpha(C.warn, d); g.fillRect(W / 2 - 1, y - 34, 2, 44);
+  }
+
+  // ---------- COPY: every non-lyric string lives here (spell-checked) ----------
+  const COPY = {
+    job: 'BUILD #0412', repo: 'compile-the-future / main', title: ['COMPILE', 'THE FUTURE'],
+    stages: ['PLAN', 'CODE', 'TEST', 'SHIP'], passed: 'ALL CHECKS PASSED',
+    credits: 'MUSIC · SUNO     PLATES · GEMINI + VEO     MOTION · CODE',
+    who: { c: 'THE CODER', a: 'THE ARCHITECT', o: 'THE ORCHESTRATOR', ao: 'ARCHITECT + ORCHESTRATOR', p: 'THE PRINCIPAL',
+           f: 'THE FIXER', crew: 'THE CREW' },
+    log: ['plan › split feature into 8 branches', 'agent › spawn worker pool', 'test › auth/session ✓', 'lint › 0 issues',
+          'merge › lane 12 → main', 'trace › p99 41ms', 'refactor › core/compiler', 'cache › hit 97.2%', 'test › parser ✓',
+          'agent › retry lane 7', 'build › link 2,048 modules', 'deploy › canary 5%', 'test › e2e checkout ✓', 'agent › handoff 31 → 32',
+          'gc › freed 1.2 GB', 'infer › 18k tok/s', 'review › approve diff #883', 'test › fuzz 10k cases ✓',
+          'policy › ethical acceleration ✓'],
+    // the ending (after the end card): a release, in the video's own language
+    ethics: { tag: '$ git tag -a v1.0 -m "ethical acceleration"', push: '$ git push --tags', checks: ['BUILD', 'TEST', 'ETHICS REVIEW', 'SHIP'],
+              board: ['ETHICAL', 'ACCELERATION'], boardTitle: 'NEXT RELEASE · FOR EVERYONE', boardTag: '#ethacc',
+              call: 'SPREAD AWARENESS!', hash: '#ethacc' },
+    // hidden whispers: barely-there text for the ones who look closely (time s, text, place, alpha)
+    whispers: [[11.5, 'ETHICAL ACCELERATION', 'rail', 0.16], [47.0, '#ethacc', 'right', 0.14], [66.5, 'ethical acceleration', 'under-build', 0.15],
+               [99.0, 'ETHICAL ACCELERATION', 'left', 0.13], [128.5, '#ethacc', 'rail', 0.16], [160.5, 'ethical acceleration', 'right', 0.13],
+               [195.5, 'ETHICAL ACCELERATION', 'under-build', 0.14], [238.0, '#ethacc', 'left', 0.14], [262.0, 'ethical acceleration', 'rail', 0.15],
+               [285.0, 'ETHICAL ACCELERATION', 'right', 0.12]],
+  };
+
+  // ---------- THE BUILD: the through-line pipeline status (keyframes by song section) ----------
+  // st: status word, col: token, p: progress at section start -> end, ag: agents at start -> end, stage: active stage
+  const BUILD_KF = {
+    intro:     { st: 'QUEUED',      col: 'dim',  p: [0, 0],    ag: [1, 1],       stage: 0 },
+    verse1:    { st: 'RUNNING',     col: 'cool', p: [0, 6],    ag: [1, 1],       stage: 0 },
+    pre1:      { st: 'BRANCHING',   col: 'mag',  p: [6, 20],   ag: [2, 64],      stage: 1 },
+    chorus1:   { st: 'RUNNING',     col: 'cool', p: [20, 37],  ag: [64, 1024],   stage: 1 },
+    drop1:     { st: 'WARN · THERMAL', col: 'warn', p: [37, 58], ag: [1024, 2048], stage: 1 },
+    inter1:    { st: 'RUNNING',     col: 'cool', p: [58, 61],  ag: [2048, 2048], stage: 2 },
+    verse2:    { st: 'TESTS',       col: 'cool', p: [61, 72],  ag: [2048, 4096], stage: 2, fail: 3 },
+    pre2:      { st: 'RETRY',       col: 'warn', p: [72, 80],  ag: [4096, 4096], stage: 2, fail: 2 },
+    chorus2:   { st: 'FAIL · OVERHEAT', col: 'mag', p: [80, 88], ag: [4096, 8192], stage: 2, fail: 1, blink: 1 },
+    breakdown: { st: 'CONVERGING',  col: 'cool', p: [88, 99],  ag: [8192, 1],    stage: 2 },
+    build:     { st: 'DEPLOYING',   col: 'signal', p: [100, 100], ag: [1, 1],    stage: 3 },
+    final:     { st: 'LIVE',        col: 'signal', p: [100, 100], ag: [1, 1],    stage: 3 },
+    tag:       { st: 'LIVE · SCALING', col: 'signal', p: [100, 100], ag: [1, 1], stage: 3 },
+    outro:     { st: 'LIVE · 1 WORLD', col: 'signal', p: [100, 100], ag: [1, 1], stage: 3 },
+    end:       { st: 'LIVE · 1 WORLD', col: 'signal', p: [100, 100], ag: [1, 1], stage: 3 },
+  };
+  let GREEN_T = 199.5;                                        // the sung word "check" (set from lyrics-words in load)
+  const songSec = t => (SB?.song_map || []).find(s => t >= s.start && t < s.end) || { name: 'intro', start: 0, end: 1 };
+  function buildState(t) {
+    const s = songSec(t), K = BUILD_KF[s.name] || BUILD_KF.intro, u = clamp((t - s.start) / Math.max(0.01, s.end - s.start));
+    let st = K.st, col = C[K.col], p = lerp(K.p[0], K.p[1], u), ag = Math.round(K.ag[0] * Math.pow(K.ag[1] / K.ag[0], u));
+    let stage = K.stage, fail = K.fail || 0, green = 0;
+    if (s.name === 'breakdown' && t >= GREEN_T) { st = 'PASSED ✔'; col = C.signal; p = 100; ag = 1; stage = 3; fail = 0; }
+    if (t >= GREEN_T) green = 1;
+    return { st, col, p, ag, stage, fail, blink: K.blink, green, sec: s };
+  }
+  function buildPanel(t) {
+    const b = buildState(t), on = ease((t - 0.8) / 1.2) * (1 - ease((t - (SB?.markers?.end_card ?? 1e9)) / 0.6));
+    if (on <= 0) return;
+    const ck = cardK(t), A = on * (1 - 0.35 * ck), x = 96, y = 54;
+    g.save(); g.filter = 'blur(22px)'; g.fillStyle = `rgba(0,0,0,${0.45 * A})`; g.fillRect(x - 30, y - 20, 520, 170); g.restore();
+    label(`${COPY.job} · ${COPY.repo}`, x, y + 14, C.type, 0.55 * A, 15);
+    // status word + LED (blinks on FAIL; flips green on the check)
+    const blink = b.blink ? (Math.floor(t * B.bpm / 60 * 2) % 2 ? 1 : 0.35) : 1;
+    const gk = b.green ? clamp((t - GREEN_T) / 0.15) : 0;
+    g.fillStyle = alpha(b.col, A * blink); g.shadowColor = b.col; g.shadowBlur = 14 + 30 * Math.exp(-(t - GREEN_T) * 2) * gk;
+    g.beginPath(); g.arc(x + 9, y + 44, 8, 0, Math.PI * 2); g.fill(); g.shadowBlur = 0;
+    label(b.st, x + 28, y + 58, b.col, A * (0.4 + 0.6 * blink), 40, 'left', FONT_D, 800);
+    // progress bar
+    const bw = 400, py = y + 82;
+    g.fillStyle = alpha(C.dim, 0.7 * A); g.fillRect(x, py, bw, 6);
+    g.fillStyle = alpha(b.col, A); g.fillRect(x, py, bw * b.p / 100, 6);
+    label(`${b.p.toFixed(0).padStart(3, ' ')}%`, x + bw + 14, py + 8, C.type, 0.8 * A, 16);
+    label(`AGENTS ${b.ag.toLocaleString('en-US')}`, x, py + 32, C.type, 0.7 * A, 16);
+    if (b.fail) label(`${b.fail} FAILING`, x + 200, py + 32, C.mag, A * (b.blink ? blink : 1), 16);
+    // stage chips
+    COPY.stages.forEach((sname, i) => {
+      const cx = x + i * 100, on2 = i <= b.stage, cur = i === b.stage;
+      g.strokeStyle = alpha(on2 ? b.col : C.dim, A * (cur ? 1 : 0.6)); g.lineWidth = cur ? 2 : 1;
+      g.strokeRect(cx, py + 46, 88, 24);
+      if (cur) { g.fillStyle = alpha(b.col, 0.18 * A); g.fillRect(cx, py + 46, 88, 24); }
+      label(sname, cx + 44, py + 64, on2 ? C.type : C.dim, A * (on2 ? 0.9 : 0.6), 14, 'center');
+    });
+  }
+
+  function hud(t, d) {
+    const s = songSec(t), c = cutAt(t);
+    g.font = `500 16px ${FONT_M}`; g.textBaseline = 'top'; g.textAlign = 'right';
+    const tc = `${String(Math.floor(t / 60)).padStart(2, '0')}:${(t % 60).toFixed(2).padStart(5, '0')}`;
+    g.fillStyle = alpha(C.type, 0.7 * d); g.fillText(`T ${tc}   ${B.bpm.toFixed(0)} BPM`, W - 96, 54);
+    g.fillStyle = alpha(C.cool, 0.8 * d); g.fillText((s.chapter || s.name).toUpperCase(), W - 96, 78);
+    const db = last(t, B.downbeats).i;
+    g.fillStyle = alpha(C.type, 0.45 * d);
+    g.fillText(`NODE ${String(Math.floor(rand(db) * 9000 + 1000))} · GPU ${(55 + loud(t) * 40).toFixed(0)}°C · LOAD ${(loud(t) * 100).toFixed(0).padStart(3, '0')}`, W - 96, 102);
+    g.textAlign = 'left';
+  }
+
+  // agent log: small lines scrolling on the beat (bottom right), seeded by beat index
+  function agentLog(t, d) {
+    if (d < 0.05) return;
+    const bt = last(t, B.beats), n = 6, x = W - 96, y0 = H - 250;
+    g.font = `500 15px ${FONT_M}`; g.textAlign = 'right'; g.textBaseline = 'alphabetic';
+    for (let k = 0; k < n; k++) {
+      const i = bt.i - k; if (i < 0) break;
+      const line = COPY.log[Math.floor(hash(i, 5) * COPY.log.length)], id = String(Math.floor(hash(i, 6) * 999)).padStart(3, '0');
+      const rise = k === 0 ? (1 - ease(bt.age / 0.15)) * 22 : 0;
+      const col = line.includes('retry') ? C.warn : line.includes('✓') ? C.cool : k % 3 === 1 ? C.mag : C.type;
+      g.fillStyle = alpha(col, d * (k === 0 ? 0.95 : 0.6 - k * 0.08));
+      g.fillText(`a-${id} ${line}`, x, y0 + (n - 1 - k) * 22 + rise);
+    }
+    g.textAlign = 'left';
+  }
+
+  // ---------- HIGHLIGHT LYRICS (assets/overlay/highlights.json) ----------
+  // Cards, not subtitles: ~1 in 3 phrases. style: type | flap | slam | anchor. Per-character timing from the
+  // forced-aligned words: nothing appears before it is sung.
+  let WORDS = [], HL = [], CARD_RECT = null;
+  function anchorTime(spec, isEnd) {                          // '@N' phrase index, '@N$' its end, '+x' offset, number = s
+    if (typeof spec === 'number') return spec;
+    let [txt, plus] = String(spec).split('+');
+    let v = null;
+    if (txt.startsWith('@')) { const e = txt.endsWith('$'), i = parseInt(txt.slice(1)); const l = LYR[i]; if (l) v = e ? l.end : l.t; }
+    else if (txt.trim() !== '' && !isNaN(+txt)) v = +txt;
+    else { let n = 1; if (txt.includes('#')) { const [x, y] = txt.split('#'); txt = x; n = +y; }
+      const h = LYR.filter(l => l.text.toLowerCase().startsWith(txt.trim().toLowerCase()))[n - 1]; if (h) v = isEnd ? h.end : h.t; }
+    if (v == null) { console.error('anchor not found:', spec); return null; }
+    return v + (plus ? +plus : 0);
+  }
+  function resolveHighlights(def) {
+    HL = [];
+    for (const c of (def?.cards || [])) {
+      const t0 = anchorTime(c.from), t1 = c.to != null ? anchorTime(c.to, true) : (typeof c.from === 'string' && c.from.startsWith('@') ? anchorTime(c.from + '$') : null);
+      if (t0 == null || t1 == null || !(t1 > t0)) { console.error('bad card', c); continue; }
+      const rows = c.text.split('/').map(r => r.trim());
+      const toks = rows.flatMap((r, ri) => r.split(/\s+/).map(w => ({ w, row: ri })));
+      const ws = WORDS.filter(w => w.start >= t0 - 0.08 && w.start < t1 - 0.05);
+      let tt;
+      if (ws.length === toks.length) tt = ws.map(w => [Math.max(w.start, t0), Math.max(w.end, w.start + 0.12)]);
+      else { const span = (t1 - t0) * 0.75; tt = toks.map((_, i) => [t0 + span * i / toks.length, t0 + span * (i + 1) / toks.length]); }
+      HL.push({ ...c, t0, t1, rows, toks, tt, hold: c.hold ?? 0.35 });
+    }
+    HL.sort((a, b) => a.t0 - b.t0);
+    for (let i = 0; i < HL.length; i++) {                     // a card ends before the next one starts
+      const nx = HL[i + 1]; HL[i].tEnd = Math.min(HL[i].t1 + HL[i].hold, nx ? nx.t0 - 0.05 : 1e9);
+    }
+  }
+  const cardAt = t => { for (const c of HL) if (t >= c.t0 - 0.01 && t < c.tEnd + 0.3) return c; return null; };
+  const cardEnv = (c, t) => clamp((t - c.t0) / 0.08) * (1 - clamp((t - c.tEnd) / 0.3));
+  const cardK = t => { const c = cardAt(t); return c ? cardEnv(c, t) : 0; };
+  // per-character ages: token k's letters appear across min(word duration, 0.4 s) from its start
+  function charTimes(c, t) {
+    return c.toks.map((tk, k) => {
+      const [a, b] = c.tt[k], dur = Math.min(0.4, Math.max(0.08, b - a));
+      return [...tk.w].map((ch, j) => ({ ch, age: t - (a + dur * j / tk.w.length), row: tk.row }));
+    });
+  }
+  function backing(x, y, w, h, a) {
+    g.save(); g.filter = 'blur(26px)'; g.fillStyle = `rgba(0,0,0,${0.55 * a})`; g.fillRect(x - 40, y - 30, w + 80, h + 60); g.restore();
+  }
+  // where a card sits: explicit pos, else left of an active scene, else opposite the performer, else centre
+  function cardSide(c) {
+    if (c.pos && c.pos !== 'auto') return c.pos;
+    if (sceneAt(c.t0 + 0.05)) return 'left';
+    const p = plateAt(c.t0 + 0.05);
+    if (p?.s.person?.bbox) { const [bx, , bw] = p.s.person.bbox, cx = p.map(bx + bw / 2, 0.5)[0]; return cx > W / 2 ? 'left' : 'right'; }
+    return 'center';
+  }
+  function typeCard(c, t, e) {
+    const side = cardSide(c), size = c.size || 46, lh = size * 1.25, x = side === 'right' ? 1060 : 96;
+    const y0 = (c.y ?? 0.62) * H;
+    const ct = charTimes(c, t);
+    g.font = `400 ${size}px ${FONT_M}`; g.textBaseline = 'alphabetic';
+    const rows = c.rows.map(() => '');
+    let lastAge = 1e9, lastRow = 0;
+    ct.forEach((wd, k) => { wd.forEach(ch => { if (ch.age >= 0) { rows[ch.row] += ch.ch; if (ch.age < lastAge) { lastAge = ch.age; lastRow = ch.row; } } });
+      if (wd.length && wd[wd.length - 1].age >= 0 && k + 1 < ct.length && ct[k + 1][0].row === wd[0].row) rows[wd[0].row] += ' '; });
+    const wmax = Math.max(...c.rows.map(r => g.measureText('> ' + r.toUpperCase()).width));
+    backing(x, y0 - size, wmax, lh * c.rows.length, e);
+    CARD_RECT = [x - 20, y0 - size - 20, wmax + 40, lh * c.rows.length + 40];
+    const out = clamp((t - c.tEnd) / 0.3);
+    rows.forEach((r, i) => {
+      if (!r && i > 0) return;
+      const y = y0 + i * lh, gx = out > 0 ? (hash(i + Math.floor(t * 30), 4) - 0.5) * 60 * out : 0;
+      g.fillStyle = alpha(C.cool, e * 0.9); g.fillText('>', x + gx, y);
+      g.fillStyle = alpha(c.color ? C[c.color] : C.type, e); g.fillText(r.toUpperCase(), x + gx + size * 1.1, y);
+      if (i === lastRow) {                                    // block cursor after the newest char (blinks on the beat)
+        const cw = g.measureText(r.toUpperCase()).width, bl = last(t, B.beats).age < 0.2 || lastAge < 0.3 ? 1 : 0.25;
+        g.fillStyle = alpha(C.cool, e * bl); g.fillRect(x + gx + size * 1.1 + cw + 4, y - size * 0.8, size * 0.55, size * 0.9);
+      }
+    });
+  }
+  const FLAPCH = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#→✔';
+  function flapTile(x, y, w, h, A, Bc, phi, col, e) {
+    const draw = (ch, half, sy) => {
+      g.save(); g.beginPath(); g.rect(x, half ? y + h / 2 : y, w, h / 2); g.clip();
+      if (sy !== 1) { g.translate(0, y + h / 2); g.scale(1, sy); g.translate(0, -(y + h / 2)); }
+      const gr = g.createLinearGradient(0, y, 0, y + h); gr.addColorStop(0, '#1d2228'); gr.addColorStop(1, '#0b0d10');
+      g.fillStyle = gr; g.globalAlpha = e; g.fillRect(x, y, w, h);
+      g.fillStyle = col; g.font = `800 ${h * 0.78}px ${FONT_D}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText(ch, x + w / 2, y + h / 2 + 2); g.restore();
+    };
+    if (phi <= 0 || phi >= 1) { draw(phi >= 1 ? Bc : A, 0, 1); draw(phi >= 1 ? Bc : A, 1, 1); }
+    else {
+      draw(Bc, 0, 1); draw(A, 1, 1);
+      const cs = Math.cos(Math.PI * phi);
+      if (cs > 0) draw(A, 0, cs); else draw(Bc, 1, -cs);
+      g.fillStyle = `rgba(0,0,0,${0.35 * Math.sin(Math.PI * phi) * e})`; g.fillRect(x, y, w, h);
+    }
+    g.fillStyle = `rgba(0,0,0,${0.8 * e})`; g.fillRect(x, y + h / 2 - 1, w, 2);
+  }
+  function flapCard(c, t, e) {
+    const side = cardSide(c), tw = c.tile || 54, th = tw * 1.45, gap = 5;
+    const ncol = Math.max(...c.rows.map(r => r.length)), bw = ncol * (tw + gap) + 40, bh = c.rows.length * (th + 10) + 70;
+    const cx = side === 'right' ? 1420 : side === 'left' ? 520 : W / 2, x0 = cx - bw / 2, y0 = (c.y ?? 0.5) * H - bh / 2;
+    backing(x0, y0, bw, bh, e); CARD_RECT = [x0, y0, bw, bh];
+    g.strokeStyle = alpha(C.dim, e); g.lineWidth = 1.5; g.strokeRect(x0, y0, bw, bh);
+    label(c.title || 'AGENT BOARD · LANES', x0 + 20, y0 + 32, C.warn, e, 16);
+    label(Math.floor(c.t0) % 2 ? '#ethacc' : COPY.job, x0 + bw - 20, y0 + 32, C.type, 0.35 * e, 14, 'right');
+    // each row settles on its first sung word
+    let k0 = 0;
+    c.rows.forEach((r, ri) => {
+      const ntok = r.split(/\s+/).length, ts = c.tt[k0][0]; k0 += ntok;
+      const row = r.toUpperCase().padEnd(ncol, ' ');
+      for (let i = 0; i < ncol; i++) {
+        const ch = row[i], x = x0 + 20 + i * (tw + gap), y = y0 + 50 + ri * (th + 10);
+        const st = ts + i * 0.04 - 0.25, nf = 3 + Math.floor(hash(i + ri * 31, 3) * 3), fd = 0.09;
+        const age = t - st, out = t - (c.tEnd + i * 0.03);
+        const colr = c.colorRows?.[ri] ? C[c.colorRows[ri]] : C.type;
+        let A = ' ', Bc = ' ', phi = 0;
+        if (out > 0) { A = ch; Bc = ' '; phi = clamp(out / fd); }
+        else if (age > 0) {
+          const f = Math.floor(age / fd);
+          if (f >= nf) { A = Bc = ch; phi = 1; }
+          else { const r0 = n => n < 0 ? ' ' : FLAPCH[Math.floor(hash(i * 7 + ri * 13 + n, 9) * FLAPCH.length)];
+            A = r0(f - 1); Bc = f === nf - 1 ? ch : r0(f); phi = (age - f * fd) / fd; }
+        }
+        flapTile(x, y, tw, th, A, Bc, phi, ch === ' ' ? '#000' : colr, e);
+        const settle = age - nf * fd;
+        if (settle > 0 && settle < 0.06 && ch !== ' ') { g.fillStyle = alpha(C.type, 0.5 * e); g.fillRect(x, y, tw, th); }
+      }
+    });
+  }
+  function slamCard(c, t, e) {
+    const side = cardSide(c);
+    let size = c.size || 150;
+    g.font = `900 ${size}px ${FONT_D}`; if ('letterSpacing' in g) g.letterSpacing = '4px';
+    const maxW = side === 'center' ? W - 240 : 820;
+    const wmax = Math.max(...c.rows.map(r => g.measureText(r.toUpperCase()).width));
+    if (wmax > maxW) size = Math.floor(size * maxW / wmax);
+    g.font = `900 ${size}px ${FONT_D}`;
+    const lh = size * 0.98, cx = side === 'right' ? 1420 : side === 'left' ? 520 : W / 2;
+    const yc = (c.y ?? 0.45) * H, y0 = yc - (c.rows.length - 1) * lh / 2;
+    const ws = Math.max(...c.rows.map(r => g.measureText(r.toUpperCase()).width));
+    backing(cx - ws / 2, y0 - size * 0.55, ws, lh * c.rows.length, e); CARD_RECT = [cx - ws / 2 - 20, y0 - size * 0.6, ws + 40, lh * c.rows.length + 20];
+    const drop = eventNear(c.t0, 'drop', 60 / B.bpm) || c.hard;
+    g.textBaseline = 'middle';
+    let k = 0;
+    c.rows.forEach((r, ri) => {
+      const words = r.toUpperCase().split(/\s+/), rw = g.measureText(r.toUpperCase()).width;
+      let x = cx - rw / 2;
+      words.forEach(wd => {
+        const age = t - c.tt[k][0]; k++;
+        const ww = g.measureText(wd).width;
+        if (age >= 0) {
+          const sp = drop ? spring(age, 24, 0.3) : spring(age, 20, 0.45), sc = drop ? 1.5 - 0.5 * sp : 1.2 - 0.2 * sp;
+          const out = clamp((t - c.tEnd) / 0.25), a = e * clamp(age / 0.05) * (1 - out);
+          const sh = drop && age < 0.25 ? (hash(Math.floor(t * 30), 3) - 0.5) * 16 * (1 - age / 0.25) : 0;
+          g.save(); g.translate(x + ww / 2 + sh, y0 + ri * lh); g.scale(sc, sc);
+          if (age < 0.35) { const s2 = Math.exp(-age * 9) * (drop ? 18 : 8);
+            g.fillStyle = alpha(C.mag, a * 0.7); g.fillText(wd, -ww / 2 - s2, 0); g.fillStyle = alpha(C.cool, a * 0.7); g.fillText(wd, -ww / 2 + s2, 0); }
+          g.fillStyle = alpha(c.color ? C[c.color] : C.type, a); g.fillText(wd, -ww / 2, 0);
+          g.restore();
+        }
+        x += ww + g.measureText(' ').width;
+      });
+    });
+    g.fillStyle = alpha(c.color ? C[c.color] : C.cool, e); g.fillRect(cx - ws / 2, y0 + (c.rows.length - 0.5) * lh + 8, ws * ease((t - c.t0) / 0.4), 5);
+    if ('letterSpacing' in g) g.letterSpacing = '0px';
+  }
+  // anchor: the text sits beside the performer's tracked face, with a leader line; no face -> type card
+  function anchorCard(c, t, e) {
+    const p = plateAt(t), person = p?.s.person;
+    const fb = person?.face, fc = fb ? p.map(fb[0] + fb[2] / 2, fb[1] + fb[3] / 2) : person?.joints?.head ? p.map(...person.joints.head) : null;
+    if (!fc) return typeCard(c, t, e);
+    const side = fc[0] > W * 0.55 ? -1 : 1, size = c.size || 64;
+    g.font = `800 ${size}px ${FONT_D}`;
+    const ct = charTimes(c, t), rows = c.rows.map(() => '');
+    ct.forEach((wd, k) => { wd.forEach(ch => { if (ch.age >= 0) rows[ch.row] += ch.ch; }); if (wd.length && wd[wd.length - 1].age >= 0) rows[wd[0].row] += ' '; });
+    const wmax = Math.max(...c.rows.map(r => g.measureText(r.toUpperCase()).width));
+    let x = fc[0] + side * 180, y = clamp(fc[1] - 40, 220, H - 200);
+    if (side < 0) x -= wmax; x = clamp(x, 96, W - 96 - wmax);
+    backing(x, y - size, wmax, size * 1.1 * c.rows.length, e); CARD_RECT = [x - 20, y - size - 20, wmax + 40, size * 1.1 * c.rows.length + 40];
+    g.strokeStyle = alpha(C.cool, 0.8 * e); g.lineWidth = 2;
+    const lx = side > 0 ? x - 16 : x + wmax + 16;
+    g.beginPath(); g.moveTo(fc[0] + side * 60, fc[1]); g.lineTo(lx, y - size * 0.35); g.stroke();
+    g.textBaseline = 'alphabetic';
+    rows.forEach((r, i) => { g.fillStyle = alpha(C.type, e); g.fillText(r.toUpperCase().trim(), x, y + i * size * 1.1); });
+  }
+  function highlight(t) {
+    CARD_RECT = null;
+    const c = cardAt(t); if (!c) return;
+    const e = cardEnv(c, t); if (e <= 0) return;
+    g.save();
+    ({ type: typeCard, flap: flapCard, slam: slamCard, anchor: anchorCard })[c.style](c, t, e);
+    g.restore();
+  }
+
+  function glue(t) {
+    // scanlines
+    g.fillStyle = 'rgba(0,0,0,0.10)';
+    for (let y = 0; y < H; y += 4) g.fillRect(0, y, W, 1);
+    // flash on strong onsets: < 3 frames, < 40%
+    const so = last(t, B.strong_onsets);
+    if (so.age < 0.08) { g.fillStyle = alpha(C.type, 0.35 * (1 - so.age / 0.08)); g.fillRect(0, 0, W, H); }
+    // iris wipe on section boundaries
+    const s = sectionAt(t), age = t - s.start;
+    if (s.start > 0 && age < 0.4) {
+      const r = ease(age / 0.4) * Math.hypot(W, H) / 2;
+      g.save(); g.strokeStyle = alpha(C.cool, 0.8 * (1 - age / 0.4)); g.lineWidth = 3;
+      g.beginPath(); g.arc(W / 2, H / 2, r, 0, Math.PI * 2); g.stroke(); g.restore();
+    }
+  }
+
+  // Music events: what the song DOES at a bar line, drawn on top of the beat-level glue.
+  //   drop        → flash (< 40%), shock ring, edge pulse; strength scales everything
+  //   break       → the frame hushes: a dark edge vignette for one bar while the bass is out
+  //   beat_change → a scan line sweeps the frame (down for half-time, up for double-time)
+  //   build       → edge ticks tighten toward the drop it leads into
+  //   hit_run     → (selected runs only) the frame strobes WITH the rapid cuts: see hitRun()
+  function music(t) {
+    hitRun(t);
+    const bar = 60 / B.bpm * 4;
+    const dr = lastEvent(t, 'drop');
+    if (dr.age < 0.6) {
+      const s = dr.e.strength, k = dr.age / 0.6;
+      g.fillStyle = alpha(C.type, 0.35 * s * clamp(1 - dr.age / 0.12)); g.fillRect(0, 0, W, H);
+      g.strokeStyle = alpha(C.cool, 0.8 * s * (1 - k)); g.lineWidth = 1 + 6 * (1 - k);
+      g.beginPath(); g.arc(W / 2, H / 2, 60 + ease(k) * Math.hypot(W, H) / 2, 0, Math.PI * 2); g.stroke();
+      if (dr.age < 0.4) {
+        const v = g.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.7);
+        v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, alpha(C.cool, 0.35 * s * (1 - dr.age / 0.4)));
+        g.fillStyle = v; g.fillRect(0, 0, W, H);
+      }
+    }
+    const br = lastEvent(t, 'break', 0.5);
+    if (br.age < bar && dr.e?.t !== br.e?.t) {
+      const h = Math.sin(Math.PI * clamp(br.age / bar)) * 0.45 * br.e.strength;
+      const v = g.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.65);
+      v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, `rgba(0,0,0,${h})`);
+      g.fillStyle = v; g.fillRect(0, 0, W, H);
+    }
+    const gc = lastEvent(t, 'beat_change', 0.3);
+    if (gc.age < 0.5) {
+      const k = ease(gc.age / 0.5), y = gc.e.dir === 'down' ? k * H : (1 - k) * H;
+      g.fillStyle = alpha(C.cool, 0.5 * (1 - k)); g.fillRect(0, y - 1, W, 2);
+      g.fillStyle = alpha(C.cool, 0.08 * (1 - k)); g.fillRect(0, gc.e.dir === 'down' ? 0 : y, W, gc.e.dir === 'down' ? y : H - y);
+    }
+    const bu = EV.find(e => e.kind === 'build' && t >= e.t && t < e.into);
+    if (bu) {
+      const k = (t - bu.t) / (bu.into - bu.t), n = 6 + Math.floor(k * 18);
+      g.strokeStyle = alpha(C.cool, 0.25 + 0.5 * k); g.lineWidth = 2;
+      for (let i = 0; i < n; i++) {
+        const x = (i + 0.5) / n * W;
+        g.beginPath(); g.moveTo(x, 0); g.lineTo(x, 10 + 20 * k); g.moveTo(x, H); g.lineTo(x, H - 10 - 20 * k); g.stroke();
+      }
+    }
+  }
+
+  // Rapid hard hits (selected hit_run events). Every hit: a 2-frame flash alternating white / accent, a strobing
+  // frame border, slice-glitch of the overlay, and a hit counter filling up. Reads as the machine "stuttering" in
+  // time with the drums. Only the few selected runs get this - on every fill it would stop being special.
+  function hitRun(t) {
+    const r = EV.find(e => e.kind === 'hit_run' && e.selected && t >= e.hits[0] - 0.01 && t < e.end + e.spacing + 0.2);
+    if (!r) return;
+    const h = last(t, r.hits); if (h.i < 0) return;
+    const n = r.hits.length, odd = h.i % 2 === 1, live = t < r.end + r.spacing;
+    const col = odd ? C.cool : C.type;
+    const fl = clamp(1 - h.age / 0.07);
+    if (fl > 0 && live) { g.fillStyle = alpha(col, 0.45 * fl); g.fillRect(0, 0, W, H); }
+    // strobing border, thicker on every second hit
+    const bw = (odd ? 14 : 6) * (live ? 1 : clamp(1 - (t - r.end - r.spacing) / 0.2));
+    g.strokeStyle = alpha(col, 0.9 * clamp(1 - h.age / 0.2) + 0.2); g.lineWidth = bw;
+    g.strokeRect(bw / 2 + 24, bw / 2 + 24, W - bw - 48, H - bw - 48);
+    // hit counter + chips
+    const cy = H * 0.78, x0 = W / 2 - n * 11;                // centred, clear of the corner HUD readouts
+    g.font = `700 26px ${FONT_M}`; g.textBaseline = 'top'; g.textAlign = 'center'; g.fillStyle = alpha(C.type, 0.9);
+    g.fillText(`HIT ${String(h.i + 1).padStart(2, '0')}/${String(n).padStart(2, '0')}`, W / 2, cy);
+    g.textAlign = 'left';
+    for (let i = 0; i < n; i++) {
+      g.fillStyle = alpha(i <= h.i ? col : C.dim, i <= h.i ? 0.95 : 0.6);
+      g.fillRect(x0 + i * 22, cy + 36, 16, 16);
+    }
+    // slice glitch of what is already drawn, for 2 frames per hit
+    if (h.age < 0.07 && live) {
+      g.save(); g.setTransform(1, 0, 0, 1, 0, 0);
+      for (let s = 0; s < 5; s++) {
+        const y = Math.floor(rand(h.i * 17 + s) * cv.height), hh = Math.floor((8 + rand(h.i * 5 + s) * 60) * DPR);
+        g.drawImage(cv, 0, y, cv.width, hh, Math.floor((rand(h.i * 3 + s) - 0.5) * 140 * DPR), y, cv.width, hh);
+      }
+      g.restore();
+    }
+  }
+
+  // intro: one line draws itself; outro: the end card after the song (storyboard.markers.end_card)
+  function introOutro(t) {
+    if (t < 3) {
+      const k = ease(t / 2.2), a = 1 - clamp((t - 2.2) / 0.8);
+      g.strokeStyle = alpha(C.cool, a); g.lineWidth = 2;
+      g.beginPath(); g.moveTo(W * 0.1, H / 2); g.lineTo(W * (0.1 + 0.8 * k), H / 2); g.stroke();
+    }
+  }
+  function endCard(t) {
+    const t0 = SB?.markers?.end_card; if (t0 == null || t < t0) return;
+    const age = t - t0, k = ease(age / 0.8), fade = 1 - clamp((t - ((SB.markers.ethics ?? B.duration + (SB.tail || 0)) - 0.8)) / 0.8);
+    g.fillStyle = `rgba(7,9,12,${0.6 * k * fade})`; g.fillRect(0, 0, W, H);
+    const A = k * fade;
+    g.textBaseline = 'middle'; g.textAlign = 'center';
+    if ('letterSpacing' in g) g.letterSpacing = '10px';
+    COPY.title.forEach((r, i) => {
+      const a = clamp((age - 0.15 * i) / 0.5) * fade;
+      g.font = `900 ${i ? 190 : 120}px ${FONT_D}`; g.fillStyle = alpha(C.type, a);
+      g.fillText(r, W / 2, H * 0.36 + i * 150 + (1 - ease((age - 0.15 * i) / 0.6)) * 30);
+    });
+    if ('letterSpacing' in g) g.letterSpacing = '0px';
+    const ca = clamp((age - 0.9) / 0.4) * fade;
+    g.fillStyle = alpha(C.signal, ca); g.shadowColor = C.signal; g.shadowBlur = 18;
+    g.beginPath(); g.arc(W / 2 - 230, H * 0.72, 9, 0, Math.PI * 2); g.fill(); g.shadowBlur = 0;
+    g.font = `400 30px ${FONT_M}`; g.textAlign = 'left'; g.fillStyle = alpha(C.signal, ca);
+    g.fillText(`${COPY.job} · ${COPY.passed}`, W / 2 - 205, H * 0.72);
+    g.textAlign = 'center'; g.font = `400 18px ${FONT_M}`; g.fillStyle = alpha(C.type, 0.6 * clamp((age - 1.4) / 0.5) * fade);
+    g.fillText(COPY.credits, W / 2, H * 0.85);
+    g.textAlign = 'left';
+  }
+
+  // hidden whispers: "Ethical Acceleration" in small, faint type in out-of-the-way places, ~3 s each
+  function whisper(t) {
+    for (const [t0, txt, where, al] of COPY.whispers) {
+      const age = t - t0; if (age < 0 || age > 3.2) continue;
+      const a = al * ease(age / 0.6) * (1 - ease((age - 2.4) / 0.8));
+      g.save(); g.font = `400 14px ${FONT_M}`; g.fillStyle = alpha(C.type, a); g.textBaseline = 'alphabetic';
+      if ('letterSpacing' in g) g.letterSpacing = '3px';
+      if (where === 'rail') { g.textAlign = 'center'; g.fillText(txt, W / 2 + 260, H - 44); }
+      else if (where === 'under-build') g.fillText(txt, 98, 246);
+      else { g.translate(where === 'right' ? W - 40 : 40, H / 2); g.rotate(where === 'right' ? Math.PI / 2 : -Math.PI / 2);
+             g.textAlign = 'center'; g.fillText(txt, 0, 0); }
+      g.restore();
+    }
+  }
+
+  // THE ENDING: Ethical Acceleration, as a release. Over the dawn plate (greyscale -> colour, see the storyboard's
+  // last cut "sat"): a typed git tag, the pipeline passing (ETHICS REVIEW included), a split-flap board, the call.
+  function ethics(t) {
+    const t0 = SB?.markers?.ethics; if (t0 == null || t < t0 - 0.01) return;
+    const age = t - t0, E = COPY.ethics, end = B.duration + (SB.tail || 0), out = 1 - clamp((t - (end - 1.0)) / 0.9);
+    g.fillStyle = `rgba(0,0,0,${1 - ease(age / 1.4)})`; g.fillRect(0, 0, W, H);           // up from black
+    g.fillStyle = `rgba(0,0,0,${0.7 * (1 - out)})`; g.fillRect(0, 0, W, H);
+    const typed = (txt, ts, x, y, size, col) => {                                       // per-character typing
+      const n = clamp(Math.floor((age - ts) / 0.035), 0, txt.length); if (n <= 0) return;
+      g.font = `400 ${size}px ${FONT_M}`; g.fillStyle = alpha(col, out); g.textBaseline = 'alphabetic'; g.textAlign = 'left';
+      const sub = txt.slice(0, n); g.fillText(sub, x, y);
+      if (n < txt.length || Math.floor(age * 2.5) % 2) { const w = g.measureText(sub).width; g.fillStyle = alpha(C.cool, out); g.fillRect(x + w + 4, y - size * 0.8, size * 0.5, size * 0.9); }
+    };
+    backing(90, 104, 780, 96, 0.9 * out * ease((age - 0.9) / 0.4));
+    typed(E.tag, 1.0, 96, 140, 30, C.type);
+    typed(E.push, 2.8, 96, 186, 30, C.type);
+    // pipeline row: a check lands on each chip (green: the build has passed)
+    E.checks.forEach((nm, i) => {
+      const ti = 3.6 + i * 0.4, a = ease((age - ti) / 0.25) * out; if (a <= 0) return;
+      g.font = `400 22px ${FONT_M}`; const w = g.measureText(nm).width + 64, x = 96 + E.checks.slice(0, i).reduce((s2, n2) => { g.font = `400 22px ${FONT_M}`; return s2 + g.measureText(n2).width + 80; }, 0), y = 236;
+      g.fillStyle = `rgba(0,0,0,${0.45 * a})`; g.fillRect(x, y, w, 40);
+      g.strokeStyle = alpha(nm === 'ETHICS REVIEW' ? C.warn : C.signal, a); g.lineWidth = nm === 'ETHICS REVIEW' ? 2.5 : 1.5; g.strokeRect(x, y, w, 40);
+      label(nm, x + 14, y + 28, C.type, a, 22, 'left', FONT_M, 400); label('✔', x + w - 30, y + 29, C.signal, a, 24, 'left', FONT_M, 400);
+    });
+    // split-flap board: ETHICAL / ACCELERATION
+    const tw = 70, th = tw * 1.45, gap = 6, ncol = 12, bw = ncol * (tw + gap) + 40, bh = 2 * (th + 12) + 80, x0 = 96, y0 = 330;
+    const bk = ease((age - 5.4) / 0.4) * out;
+    if (bk > 0) {
+      backing(x0, y0, bw, bh, bk); g.strokeStyle = alpha(C.dim, bk); g.lineWidth = 1.5; g.strokeRect(x0, y0, bw, bh);
+      label(E.boardTitle, x0 + 20, y0 + 36, C.warn, bk, 18); label(E.boardTag, x0 + bw - 20, y0 + 36, C.cool, bk, 18, 'right');
+      E.board.forEach((row, ri) => {
+        const pad = Math.floor((ncol - row.length) / 2), rw = ' '.repeat(pad) + row + ' '.repeat(ncol);
+        for (let i = 0; i < ncol; i++) {
+          const ch = rw[i], x = x0 + 20 + i * (tw + gap), y = y0 + 56 + ri * (th + 12);
+          const st = 5.7 + ri * 0.6 + i * 0.045, nf = 4 + Math.floor(hash(i + ri * 17, 3) * 3), fd = 0.08, a2 = age - st;
+          let A = ' ', Bc = ' ', phi = 0;
+          if (a2 > 0) { const f2 = Math.floor(a2 / fd);
+            if (f2 >= nf) { A = Bc = ch; phi = 1; }
+            else { const r0 = n => n < 0 ? ' ' : FLAPCH[Math.floor(hash(i * 7 + ri * 13 + n, 9) * FLAPCH.length)];
+              A = r0(f2 - 1); Bc = f2 === nf - 1 ? ch : r0(f2); phi = (a2 - f2 * fd) / fd; } }
+          flapTile(x, y, tw, th, A, Bc, phi, ch === ' ' ? '#000' : C.type, bk);
+        }
+      });
+    }
+    // the call
+    const ck = ease((age - 8.0) / 0.5) * out;
+    if (ck > 0) {
+      g.save(); if ('letterSpacing' in g) g.letterSpacing = '6px';
+      g.shadowColor = 'rgba(0,0,0,0.6)'; g.shadowBlur = 30;
+      label(E.call, 96, y0 + bh + 110 + 20 * (1 - ck), C.type, ck, 92, 'left', FONT_D, 900);
+      g.restore(); if ('letterSpacing' in g) g.letterSpacing = '0px';
+      label(E.hash, 100, y0 + bh + 170, C.cool, ease((age - 8.6) / 0.4) * out, 40, 'left', FONT_M, 400);
+    }
+  }
+
+  // ---------- SCENES: lyric-driven graphics (take over from the HUD, then hand back) ----------
+  // Each scene is (t, k, s) → draws, k = fade envelope 0..1, s = {start, end, age, u} with u = progress 0..1.
+  // Stage = the right half (SX, SY centre); highlight cards sit left. Timing: assets/overlay/scenes.json.
+  const SX = 1400, SY = 540, RX = SX, RY = SY;
+  const label = (txt, x, y, col, a, size = 18, align = 'left', font = FONT_M, weight = 600) => {
+    g.font = `${weight} ${size}px ${font}`; g.textAlign = align; g.textBaseline = 'alphabetic';
+    g.fillStyle = alpha(col, a); g.fillText(txt, x, y); g.textAlign = 'left';
+  };
+  const stageTag = (txt, k, col = C.warn) => {                // small amber tag at the top of the stage
+    label(txt, SX - 420, 200, col, 0.9 * k, 16); g.fillStyle = alpha(col, 0.6 * k); g.fillRect(SX - 420, 210, 60, 2);
+  };
+  const bt = t => last(t, B.beats), dbt = t => last(t, B.downbeats);
+  const line = (x0, y0, x1, y1) => { g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke(); };
+  const dot = (x, y, r) => { g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); };
+  const glow = (col, b) => { g.shadowColor = col; g.shadowBlur = b; };
+
+  // binary agent tree: root left, 64 leaves right. grow = depth shown (0..6), prune = 0..1, flow = returns pulsing
+  function tree(t, k, grow, prune, flow) {
+    const D = 6, x0 = SX - 400, x1 = SX + 400, top = 230, bot = 850;
+    const nodeY = (d, i) => top + (bot - top) * (i + 0.5) / Math.pow(2, d), nodeX = d => x0 + (x1 - x0) * d / D;
+    const weak = (d, i) => d >= 3 && hash(i + d * 100, 21) < 0.32;      // weak paths (pruned in "test it, trim it")
+    const deadAt = (d, i) => { for (let dd = d, ii = i; dd >= 3; dd--, ii >>= 1) if (weak(dd, ii)) return hash(ii + dd * 100, 22); return 2; };
+    g.lineWidth = 2;
+    for (let d = 1; d <= D; d++) {
+      const gk = clamp(grow - (d - 1));
+      if (gk <= 0) break;
+      for (let i = 0; i < Math.pow(2, d); i++) {
+        const px = nodeX(d - 1), py = nodeY(d - 1, i >> 1), nx = nodeX(d), ny = nodeY(d, i);
+        const dead = prune > deadAt(d, i), col = (i + d) % 2 ? C.cool : C.mag;
+        g.strokeStyle = alpha(dead ? C.dim : col, k * (dead ? 0.35 : 0.75));
+        const ex = lerp(px, nx, ease(gk)), ey = lerp(py, ny, ease(gk));
+        g.beginPath(); g.moveTo(px, py); g.bezierCurveTo(px + (nx - px) * 0.5, py, px + (nx - px) * 0.5, ey, ex, ey); g.stroke();
+        g.fillStyle = alpha(dead ? C.dim : C.type, k); dot(ex, ey, d === D ? 3.5 : 3);
+        if (dead && weak(d, i) && d === 3 + Math.floor(hash(i, 23) * 0) ) {}
+        if (dead && weak(d, i)) { g.strokeStyle = alpha(C.mag, k * clamp((prune - deadAt(d, i)) * 6)); line(ex - 8, ey - 8, ex + 8, ey + 8); line(ex - 8, ey + 8, ex + 8, ey - 8); }
+        if (flow > 0 && !dead && d === D) {                   // a return pulse travels leaf -> root
+          const ph = (flow * 1.4 + hash(i, 24)) % 1;
+          let dd = D, ii = i, xa = nx, ya = ny; const steps = ph * D, sd = Math.floor(steps), f = steps - sd;
+          for (let s2 = 0; s2 < sd; s2++) { ii >>= 1; dd--; xa = nodeX(dd); ya = nodeY(dd, ii); }
+          const xb = nodeX(Math.max(0, dd - 1)), yb = nodeY(Math.max(0, dd - 1), ii >> 1);
+          g.fillStyle = alpha(C.type, k); glow(C.cool, 12); dot(lerp(xa, xb, f), lerp(ya, yb, f), 4); g.shadowBlur = 0;
+        }
+      }
+    }
+    g.fillStyle = alpha(C.cool, k); glow(C.cool, 10 + (flow > 0 ? 20 * Math.exp(-bt(t).age * 6) : 0)); dot(x0, (top + bot) / 2, 9); g.shadowBlur = 0;
+    const leaves = Math.pow(2, Math.min(D, Math.floor(grow)));
+    label(`AGENTS ${leaves}`, x0, 900, C.type, 0.8 * k, 18);
+  }
+
+  const SCENES = {
+    cursor(t, k, s) {                                         // a terminal, one cursor, a held breath
+      const x0 = SX - 360, y0 = 300, w = 720, h = 420;
+      g.strokeStyle = alpha(C.dim, k); g.lineWidth = 1.5; g.strokeRect(x0, y0, w, h);
+      g.fillStyle = alpha(C.dim, 0.5 * k); g.fillRect(x0, y0, w, 30);
+      label('tty1 — ~/compile-the-future', x0 + 14, y0 + 21, C.type, 0.6 * k, 14);
+      const blink = (Math.floor(t * B.bpm / 60) % 2 === 0) ? 1 : 0.15;
+      label('$', x0 + 30, y0 + 100, C.cool, k, 40, 'left', FONT_M, 400);
+      g.fillStyle = alpha(C.cool, k * blink); glow(C.cool, 24 * blink); g.fillRect(x0 + 66, y0 + 66, 24, 40); g.shadowBlur = 0;
+      const br = 0.5 - 0.5 * Math.cos(s.age * 2 * Math.PI / 6);  // a slow breath
+      g.strokeStyle = alpha(C.cool, 0.6 * k); g.lineWidth = 2; g.beginPath();
+      for (let x = 0; x <= w - 60; x += 6) { const u = x / (w - 60); g.lineTo(x0 + 30 + x, y0 + h - 90 - br * 50 * Math.sin(u * Math.PI)); }
+      g.stroke();
+      label(s.start > 200 ? 'PULSE · 152 BPM' : 'AWAITING INPUT', x0 + 30, y0 + h - 24, C.type, 0.5 * k, 14);
+    },
+    oneline(t, k, s) {                                        // the whole world pinned to one line
+      stageTag('SCOPE · WORLD → 1 LINE', k);
+      const f = ease((s.u - 0.15) / 0.6), R = 260;
+      for (let i = 0; i < 500; i++) {
+        const la = Math.acos(1 - 2 * hash(i, 31)), lo = hash(i, 32) * 6.283 + t * 0.4;
+        const x = SX + Math.sin(la) * Math.cos(lo) * R, y = SY + Math.cos(la) * R, z = Math.sin(la) * Math.sin(lo);
+        const tx = SX - 380 + 760 * (i / 500);
+        g.fillStyle = alpha(z > 0 ? C.cool : C.dim, k * (0.5 + 0.5 * f));
+        dot(lerp(x, tx, f), lerp(y, SY, f), 2);
+      }
+      if (f > 0.95) { g.strokeStyle = alpha(C.cool, k); glow(C.cool, 16); g.lineWidth = 3; line(SX - 380, SY, SX + 380, SY); g.shadowBlur = 0; }
+    },
+    minds(t, k, s) {                                          // one instruction, then little minds wake up
+      label('$ build --agents --parallel', SX - 400, 260, C.cool, k, 30, 'left', FONT_M, 400);
+      const tm = anchorTime('@9') ?? s.start + 3, b0 = last(tm, B.beats).i, nb = bt(t).i - b0;
+      const cols = 8, rows = 5;
+      for (let i = 0; i < cols * rows; i++) {
+        const x = SX - 350 + (i % cols) * 100, y = 380 + Math.floor(i / cols) * 100;
+        const wake = t >= tm && i < (nb + 1) * 3, age = wake ? t - (B.beats[b0 + Math.floor(i / 3)] ?? tm) : 0;
+        g.strokeStyle = alpha(C.dim, k); g.lineWidth = 1.5; g.beginPath(); g.arc(x, y, 18, 0, 6.283); g.stroke();
+        if (wake) { const col = i % 3 ? C.cool : C.mag; g.fillStyle = alpha(col, k); glow(col, 20 * Math.exp(-age * 3)); dot(x, y, 10 + 6 * Math.exp(-age * 5)); g.shadowBlur = 0; }
+      }
+      label(`MINDS AWAKE ${Math.min(cols * rows, t >= tm ? (nb + 1) * 3 : 0)}/${cols * rows}`, SX - 400, 900, C.type, 0.8 * k, 18);
+    },
+    branch(t, k, s) { stageTag('AGENT TREE · BRANCHING', k, C.mag); tree(t, k, 0.5 + s.u * 6.2, 0, 0); },
+    prune(t, k, s) { stageTag('TEST · TRIM WEAK PATHS', k); tree(t, k, 7, ease(s.u * 1.3), 0); },
+    flow(t, k, s) { stageTag('RETURNS → MAIN', k, C.cool); tree(t, k, 7, 1, s.age / 2.5); },
+    spark(t, k, s) {                                          // a spark grows into circuit traces and chips
+      stageTag('SPARK → MACHINE', k);
+      const gr = ease(s.u * 1.2), sp = Math.exp(-s.age * 3);
+      for (let i = 0; i < 12; i++) {
+        const a = i / 12 * 6.283 + 0.2, l1 = 120 + hash(i, 41) * 120, l2 = 80 + hash(i, 42) * 160;
+        const x1 = SX + Math.cos(a) * l1, y1 = SY + Math.sin(a) * l1 * 0.8;
+        const hx = Math.abs(Math.cos(a)) > 0.5, x2 = hx ? x1 + Math.sign(Math.cos(a)) * l2 : x1, y2 = hx ? y1 : y1 + Math.sign(Math.sin(a)) * l2 * 0.6;
+        const L1 = clamp(gr * 2), L2 = clamp(gr * 2 - 1);
+        g.strokeStyle = alpha(i % 4 ? C.cool : C.mag, k * 0.85); g.lineWidth = 2;
+        line(SX, SY, lerp(SX, x1, L1), lerp(SY, y1, L1)); if (L2 > 0) line(x1, y1, lerp(x1, x2, L2), lerp(y1, y2, L2));
+        if (L2 >= 1) { g.strokeRect(x2 - 12, y2 - 12, 24, 24); g.fillStyle = alpha(C.type, k * (0.4 + 0.6 * Math.exp(-bt(t).age * 6))); g.fillRect(x2 - 4, y2 - 4, 8, 8); }
+      }
+      g.fillStyle = alpha(C.warn, k); glow(C.warn, 30 + 40 * sp); dot(SX, SY, 10 + 20 * sp); g.shadowBlur = 0;
+    },
+    tokens(t, k, s) {                                         // tokens fly in one by one and align into a grid
+      stageTag('TOKEN STREAM · ALIGN', k, C.cool);
+      const TK = ['fn', '=>', 'let', '{', '}', 'map', 'ok', 'ret', '0x1f', 'agt', 'ctx', 'run', '&&', 'pub', 'use', 'mod', 'dyn', 'impl'];
+      const cols = 8, rows = 6, n = cols * rows;
+      g.font = `400 18px ${FONT_M}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+      for (let i = 0; i < n; i++) {
+        const a = clamp((s.u * 1.5 - i / n * 0.9) / 0.25), e = ease(a); if (a <= 0) continue;
+        const gx = SX - 350 + (i % cols) * 100, gy = 300 + Math.floor(i / cols) * 80;
+        const sx = SX + 500 + hash(i, 51) * 200, sy = 200 + hash(i, 52) * 700;
+        const x = lerp(sx, gx, e), y = lerp(sy, gy, e) + (1 - e) * Math.sin(t * 5 + i) * 30;
+        const col = i % 5 === 0 ? C.mag : C.cool;
+        g.strokeStyle = alpha(col, k * (0.4 + 0.6 * e)); g.lineWidth = 1.5; g.strokeRect(x - 40, y - 22, 80, 44);
+        if (e > 0.98 && a < 1.1) { g.fillStyle = alpha(col, 0.2 * k); g.fillRect(x - 40, y - 22, 80, 44); }
+        g.fillStyle = alpha(C.type, k * e); g.fillText(TK[i % TK.length], x, y);
+      }
+      g.textAlign = 'left';
+      label(`TOKENS ${Math.floor(clamp(s.u * 1.5) * 48 * 1024).toLocaleString('en-US')}`, SX - 390, 900, C.type, 0.8 * k, 18);
+    },
+    ship(t, k, s) {                                           // ship before the dawn: deploy rises over the horizon
+      stageTag('DEPLOY › PROD', k);
+      const hy = 720;
+      g.strokeStyle = alpha(C.dim, k); g.lineWidth = 2; line(SX - 420, hy, SX + 420, hy);
+      g.strokeStyle = alpha(C.warn, 0.35 * k); g.lineWidth = 2;
+      for (let r = 0; r < 4; r++) { g.beginPath(); g.arc(SX + 200, hy, 120 + r * 40 + s.u * 10, Math.PI, 2 * Math.PI); g.stroke(); }
+      const up = ease(s.u * 1.1), py = hy - 30 - up * 380, px = SX - 120;
+      g.strokeStyle = alpha(C.cool, k); g.lineWidth = 2.5;
+      g.strokeRect(px - 40, py - 40, 80, 80); line(px - 40, py - 40, px - 20, py - 60); line(px + 40, py - 40, px + 60, py - 60);
+      line(px - 20, py - 60, px + 60, py - 60); line(px + 60, py - 60, px + 60, py + 20); line(px + 40, py + 40, px + 60, py + 20);
+      for (let i = 0; i < 14; i++) { const yy = py + 50 + i * 22; if (yy > hy) break; g.fillStyle = alpha(C.cool, k * (1 - i / 14)); g.fillRect(px - 2, yy, 4, 12); }
+      const eta = Math.max(0, 134 - s.age * 40);
+      label(`SHIPPED v2.${dbt(t).i % 40}.0   DAWN IN ${String(Math.floor(eta / 60)).padStart(2, '0')}:${String(Math.floor(eta % 60)).padStart(2, '0')}`, SX - 420, hy + 50, C.type, 0.8 * k, 18);
+    },
+    thread(t, k, s) {                                         // one bright thread weaves through the grid
+      stageTag('ONE THREAD · IN-BETWEEN', k, C.cool);
+      for (let i = 0; i < 9; i++) for (let j = 0; j < 7; j++) { g.fillStyle = alpha(C.dim, k); dot(SX - 400 + i * 100, 260 + j * 90, 3); }
+      const n = 200, on = ease(s.u * 1.3) * n;
+      g.strokeStyle = alpha(C.cool, k); g.lineWidth = 3; glow(C.cool, 14); g.beginPath();
+      let hx = 0, hy = 0;
+      for (let i = 0; i <= on; i++) { const u = i / n; hx = SX - 400 + u * 800; hy = SY + Math.sin(u * 18.85) * 45 + Math.sin(u * 5) * 120; i ? g.lineTo(hx, hy) : g.moveTo(hx, hy); }
+      g.stroke(); g.fillStyle = alpha(C.type, k); dot(hx, hy, 6); g.shadowBlur = 0;
+    },
+    design(t, k, s) {                                         // loose lines snap into a clean grid
+      stageTag('LINT · 0 ISSUES', k);
+      for (let i = 0; i < 36; i++) {
+        const a = ease(clamp((s.u * 1.6 - (i % 6) * 0.08 - Math.floor(i / 6) * 0.03) / 0.3));
+        const tx = SX - 330 + (i % 6) * 132, ty = 300 + Math.floor(i / 6) * 90, tw = 110;
+        const rx = SX + (hash(i, 61) - 0.5) * 800, ry = SY + (hash(i, 62) - 0.5) * 600, ang = (hash(i, 63) - 0.5) * 3, rl = 60 + hash(i, 64) * 120;
+        const cx = lerp(rx, tx, a), cy = lerp(ry, ty, a), an = lerp(ang, 0, a), ll = lerp(rl, tw, a);
+        g.strokeStyle = alpha(a > 0.98 ? C.cool : C.mag, k * 0.9); g.lineWidth = a > 0.98 ? 4 : 2;
+        line(cx - Math.cos(an) * ll / 2, cy - Math.sin(an) * ll / 2, cx + Math.cos(an) * ll / 2, cy + Math.sin(an) * ll / 2);
+      }
+    },
+    thermal(t, k, s) {                                        // the data center smokes: racks heating up
+      const hot = songSec(t).name === 'chorus2';
+      stageTag(hot ? 'RACK 7 · OVERHEAT · FAILOVER' : 'DATA CENTER · THERMAL', k, hot ? C.mag : C.warn);
+      const heat = clamp(0.35 + s.u * 0.7);
+      for (let r = 0; r < 3; r++) {
+        const x = SX - 330 + r * 230, y0 = 250, w = 170, uh = 46;
+        g.strokeStyle = alpha(C.dim, k); g.lineWidth = 2; g.strokeRect(x, y0, w, uh * 12 + 10);
+        for (let u = 0; u < 12; u++) {
+          const y = y0 + 5 + u * uh, h2 = hash(u + r * 12, 71), temp = clamp(heat * (0.6 + 0.6 * h2) + 0.1 * Math.sin(t * 3 + u));
+          g.fillStyle = alpha(temp > 0.85 ? (hot ? C.mag : C.warn) : C.dim, k * (0.25 + 0.5 * temp)); g.fillRect(x + 6, y + 4, (w - 50) * temp, uh - 10);
+          const led = hash(u + r * 12 + Math.floor(t * 8), 72) > 0.5;
+          g.fillStyle = alpha(temp > 0.85 ? C.warn : C.cool, k * (led ? 1 : 0.3)); dot(x + w - 18, y + uh / 2, 4);
+        }
+      }
+      for (let i = 0; i < 60; i++) {                          // smoke: closed-form rising puffs
+        const sp = 60 + hash(i, 73) * 80, ph = (s.age * sp + hash(i, 74) * 700) % 700;
+        const x = SX - 330 + hash(i, 75) * 640 + Math.sin(ph / 60 + i) * 30, y = 820 - ph;
+        g.fillStyle = `rgba(200,200,200,${0.08 * k * (1 - ph / 700)})`; dot(x, y, 14 + ph / 18);
+      }
+      label(`GPU ${(78 + heat * 18).toFixed(1)}°C  FANS ${(60 + heat * 40).toFixed(0)}%`, SX - 330, 900, hot ? C.mag : C.warn, k, 22);
+    },
+    context(t, k, s) {                                        // the context window holds the plan
+      const f = ease(s.u * 1.2);
+      g.strokeStyle = alpha(C.cool, k); g.lineWidth = 4;
+      const bx0 = SX - 400, bx1 = SX + 400, y0 = 260, y1 = 840;
+      g.beginPath(); g.moveTo(bx0 + 40, y0); g.lineTo(bx0, y0); g.lineTo(bx0, y1); g.lineTo(bx0 + 40, y1); g.stroke();
+      g.beginPath(); g.moveTo(bx1 - 40, y0); g.lineTo(bx1, y0); g.lineTo(bx1, y1); g.lineTo(bx1 - 40, y1); g.stroke();
+      const n = Math.floor(f * 120);
+      for (let i = 0; i < n; i++) { const x = bx0 + 30 + (i % 12) * 61, y = y0 + 30 + Math.floor(i / 12) * 54;
+        const plan = [3, 4, 5, 6, 7, 8, 15, 20, 27, 32, 39, 44, 51, 56, 63, 64, 65, 66, 67, 68].includes(i);
+        g.fillStyle = alpha(plan ? C.mag : C.dim, k * (plan ? 0.9 : 0.6)); g.fillRect(x, y, 50, 40); }
+      label(`CONTEXT ${Math.floor(f * 182)}k / 200k`, bx0, 890, C.type, 0.8 * k, 18);
+    },
+    noise(t, k, s) {                                          // inference cuts through the noise
+      stageTag('INFERENCE · SIGNAL / NOISE', k);
+      const cx = SX - 420 + ease(s.u * 1.2) * 840, fr = Math.floor(t * 15);
+      for (let i = 0; i < 400; i++) {
+        const x0 = SX - 420 + hash(i, 81) * 840, clean = x0 < cx;
+        const y = clean ? SY + Math.sin((x0 - SX) / 60) * 80 : 250 + hash(i * 7 + fr, 82) * 600;
+        g.fillStyle = alpha(clean ? C.cool : C.dim, k * (clean ? 0.9 : 0.7)); dot(x0, y, clean ? 3 : 2);
+      }
+      g.strokeStyle = alpha(C.type, k); g.lineWidth = 2; glow(C.cool, 16); line(cx, 230, cx, 870); g.shadowBlur = 0;
+    },
+    modules(t, k, s) {                                        // modules click into place on the beat
+      stageTag('MODULES · LINKED', k, C.cool);
+      const names = ['auth', 'api', 'db', 'ui', 'queue', 'cache', 'infer', 'log', 'core'], b0 = last(s.start, B.beats).i;
+      names.forEach((nm, i) => {
+        const tb = B.beats[b0 + 1 + i] ?? 1e9, a = t - tb, e = a < 0 ? 0 : spring(a, 22, 0.5);
+        const x = SX - 300 + (i % 3) * 210, y = 280 + Math.floor(i / 3) * 190, off = (1 - e) * (i % 2 ? 300 : -300);
+        if (a < -1) return;
+        g.globalAlpha = clamp(1 + a); g.strokeStyle = alpha(i === 8 ? C.mag : C.cool, k); g.lineWidth = 2.5;
+        g.strokeRect(x + off, y, 180, 150);
+        if (a >= 0 && a < 0.12) { g.fillStyle = alpha(C.type, 0.4 * k); g.fillRect(x, y, 180, 150); }
+        label(nm.toUpperCase(), x + off + 90, y + 85, C.type, k, 26, 'center', FONT_D, 800); g.globalAlpha = 1;
+      });
+    },
+    stack(t, k, s) {                                          // each abstraction earns its voice
+      stageTag('ABSTRACTION STACK', k);
+      const L = ['SILICON', 'RUNTIME', 'LIBRARY', 'SERVICE', 'PRODUCT'];
+      L.forEach((nm, i) => {
+        const a = ease(clamp((s.u * 1.4 - i * 0.16) / 0.25)); if (a <= 0) return;
+        const y = 800 - i * 120 - (1 - a) * 60, x = SX - 260, w = 520, d = 70;
+        g.strokeStyle = alpha(i === 4 ? C.mag : C.cool, k * a); g.lineWidth = 2;
+        g.beginPath(); g.moveTo(x, y); g.lineTo(x + w, y); g.lineTo(x + w + d, y - d * 0.6); g.lineTo(x + d, y - d * 0.6); g.closePath(); g.stroke();
+        label(nm, x + w + d + 20, y - 10, C.type, k * a, 22, 'left', FONT_D, 800);
+      });
+    },
+    suite(t, k, s) {                                          // run the suite, read every trace
+      stageTag('TEST SUITE · 4,096', k, C.cool);
+      const T2 = ['auth.session', 'parser.ast', 'agents.spawn', 'lanes.merge', 'cache.evict', 'infer.batch', 'deploy.canary', 'ui.render', 'trace.span', 'core.compile'];
+      const per = 60 / B.bpm / 2, n = Math.floor(s.age / per) + 1;
+      T2.forEach((nm, i) => { if (i >= n) return;
+        const fail = i === 3 || i === 7, y = 270 + i * 58;
+        label(`test_${nm}`, SX - 400, y, C.type, k * 0.85, 22, 'left', FONT_M, 400);
+        g.strokeStyle = alpha(C.dim, k); g.setLineDash([3, 6]); line(SX - 400 + 330, y - 7, SX + 280, y - 7); g.setLineDash([]);
+        label(fail ? 'FAIL ✕' : 'ok ✓', SX + 400, y, fail ? C.mag : C.cool, k, 22, 'right', FONT_M, 400);
+      });
+    },
+    refactor(t, k, s) {                                       // refactor down to the elegant core
+      stageTag('REFACTOR · CORE', k);
+      const f = ease(clamp((s.u - 0.1) / 0.75));
+      for (let i = 0; i < 28; i++) {
+        const w0 = 200 + hash(i, 91) * 500, x0 = SX - 380 + hash(i, 92) * 60, y0 = 250 + i * 22;
+        const w1 = 140, x1 = SX - 70, y1 = SY - 60 + (i % 8) * 16;
+        g.fillStyle = alpha(f > 0.9 ? C.cool : i % 5 ? C.dim : C.mag, k * (1 - 0.6 * f * (i >= 8 ? 1 : 0)));
+        if (i >= 8 && f > 0.9) continue;
+        g.fillRect(lerp(x0, x1, f), lerp(y0, y1, f), lerp(w0, w1, f), lerp(12, 8, f));
+      }
+      if (f > 0.9) { g.strokeStyle = alpha(C.cool, k); glow(C.cool, 20); g.lineWidth = 2; g.strokeRect(SX - 90, SY - 80, 180, 150); g.shadowBlur = 0; }
+      label(`LINES ${Math.round(lerp(18240, 212, f)).toLocaleString('en-US')}`, SX - 400, 900, C.type, 0.8 * k, 18);
+    },
+    converge(t, k, s) {                                       // a thousand lanes converge in place
+      stageTag('CONVERGE · 1,000 LANES → 1', k, C.cool);
+      const tx = SX + 330, ty = SY, f = ease(s.u * 1.3);
+      for (let i = 0; i < 90; i++) {
+        const y0 = 220 + hash(i, 101) * 660, x0 = SX - 420, cx = lerp(x0, tx, f);
+        g.strokeStyle = alpha(i % 3 ? C.cool : C.mag, k * 0.45); g.lineWidth = 1.2;
+        g.beginPath(); g.moveTo(x0, y0); g.bezierCurveTo(x0 + 300, y0, tx - 300, ty, cx, lerp(y0, ty, Math.pow(f, 1.5))); g.stroke();
+      }
+      g.fillStyle = alpha(C.type, k * f); glow(C.cool, 30 * f); dot(tx, ty, 6 + 10 * f); g.shadowBlur = 0;
+    },
+    pass(t, k, s) {                                           // one more pass makes room for more
+      stageTag('PASS 2 · FREEING SPACE', k);
+      const sx = SX - 420 + ease(s.u * 1.1) * 840;
+      for (let i = 0; i < 14; i++) for (let j = 0; j < 10; j++) {
+        const x = SX - 420 + i * 60, y = 250 + j * 60, behind = x < sx, keep = hash(i * 10 + j, 111) < 0.45;
+        if (behind && !keep) { g.strokeStyle = alpha(C.dim, k * 0.6); g.lineWidth = 1; g.strokeRect(x + 6, y + 6, 44, 44); }
+        else { g.fillStyle = alpha(behind ? C.cool : C.dim, k * (behind ? 0.7 : 0.5)); g.fillRect(x + 6, y + 6, 44, 44); }
+      }
+      g.fillStyle = alpha(C.type, k); glow(C.cool, 16); g.fillRect(sx - 1.5, 240, 3, 620); g.shadowBlur = 0;
+    },
+    alone(t, k, s) {                                          // alone at the start, now the whole system sings
+      const n = Math.floor(1 + ease(s.u * 1.2) * 59);
+      const P2 = i => i === 0 ? [SX, SY] : [SX + Math.cos(i * 2.4) * (40 + 330 * Math.sqrt(i / 60)), SY + Math.sin(i * 2.4) * (40 + 300 * Math.sqrt(i / 60))];
+      g.lineWidth = 1;
+      for (let i = 1; i < n; i++) { const [x, y] = P2(i), [px, py] = P2(Math.floor(hash(i, 121) * i)); g.strokeStyle = alpha(i % 4 ? C.cool : C.mag, k * 0.5); line(px, py, x, y); }
+      for (let i = 0; i < n; i++) { const [x, y] = P2(i), sing = loud(t) * Math.exp(-bt(t).age * 5);
+        g.fillStyle = alpha(i ? C.type : C.cool, k); dot(x, y, i ? 3 + 4 * sing * hash(i, 122) : 9); }
+      label(`NODES ${n}`, SX - 400, 900, C.type, 0.8 * k, 18);
+    },
+    wings(t, k, s) {                                          // no chaos in motion, just well-ordered wings
+      stageTag('ORDER FROM PARALLEL CHAOS', k, C.cool);
+      const f = ease(clamp((s.u - 0.1) / 0.7));
+      for (let i = 0; i < 260; i++) {
+        const side = i % 2 ? 1 : -1, j = Math.floor(i / 2) / 130, a = j * Math.PI;
+        const r = 330 * Math.sin(a) * (0.7 + 0.3 * Math.sin(3 * a));
+        const wx = SX + side * Math.sin(a * 0.9) * r, wy = SY - Math.cos(a) * r * 0.55 + (j > 0.5 ? 40 : 0);
+        const cx = SX + (hash(i, 131) - 0.5) * 800 + Math.sin(t * 2 + i) * 40, cy = SY + (hash(i, 132) - 0.5) * 600 + Math.cos(t * 1.7 + i) * 40;
+        g.fillStyle = alpha(f > 0.9 ? C.cool : (i % 3 ? C.mag : C.dim), k); dot(lerp(cx, wx, f), lerp(cy, wy, f), 2.6);
+      }
+    },
+    greencheck(t, k, s) {                                     // THE payoff: the only green in the video
+      const R = 260, pre = clamp((t - s.start) / Math.max(0.2, GREEN_T - s.start)), ok = t >= GREEN_T, ga = t - GREEN_T;
+      g.lineWidth = 10; g.strokeStyle = alpha(C.dim, k); g.beginPath(); g.arc(SX, SY, R, 0, 6.283); g.stroke();
+      g.strokeStyle = alpha(ok ? C.signal : C.cool, k); glow(ok ? C.signal : C.cool, ok ? 40 : 12);
+      g.beginPath(); g.arc(SX, SY, R, -Math.PI / 2, -Math.PI / 2 + 6.283 * (ok ? 1 : ease(pre))); g.stroke();
+      if (ok) {
+        const d = ease(ga / 0.35), P1 = [SX - 120, SY + 5], P2 = [SX - 30, SY + 95], P3 = [SX + 140, SY - 105];
+        g.lineWidth = 26; g.lineCap = 'round'; g.lineJoin = 'round'; g.beginPath(); g.moveTo(...P1);
+        const L1 = Math.hypot(90, 90), L2 = Math.hypot(170, 200), on = d * (L1 + L2);
+        if (on <= L1) g.lineTo(lerp(P1[0], P2[0], on / L1), lerp(P1[1], P2[1], on / L1));
+        else { g.lineTo(...P2); g.lineTo(lerp(P2[0], P3[0], (on - L1) / L2), lerp(P2[1], P3[1], (on - L1) / L2)); }
+        g.stroke();
+        if (ga < 1.2) { g.lineWidth = 3; g.strokeStyle = alpha(C.signal, k * (1 - ga / 1.2)); g.beginPath(); g.arc(SX, SY, R + ease(ga / 1.2) * 600, 0, 6.283); g.stroke(); }
+        g.shadowBlur = 0;
+        label(COPY.passed, SX, SY + R + 70, C.signal, k * clamp(ga / 0.3), 30, 'center', FONT_M, 400);
+      } else { g.shadowBlur = 0; label(`CHECKS ${Math.floor(ease(pre) * 4096)}/4096`, SX, SY + R + 70, C.type, k, 26, 'center', FONT_M, 400); }
+    },
+    checklist(t, k, s) {                                      // check every edge, close every seam
+      stageTag('PRE-FLIGHT', k, C.signal);
+      const items = [['EDGES', '4,096 / 4,096', '@97'], ['SEAMS', '512 / 512', '@98'], ['BREATH', 'HELD', '@99'], ['DREAM', 'COMPILING', '@100']];
+      items.forEach(([a, b, at], i) => {
+        const ti = anchorTime(at), y = 300 + i * 130, on = t >= ti, age = t - ti;
+        g.strokeStyle = alpha(on ? C.signal : C.dim, k); g.lineWidth = 3; g.strokeRect(SX - 380, y - 30, 60, 60);
+        if (on) { const d = ease(age / 0.25); g.lineWidth = 6; g.strokeStyle = alpha(C.signal, k);
+          g.beginPath(); g.moveTo(SX - 368, y); g.lineTo(SX - 356 + 8 * d, y + 14 * d); if (d >= 1) g.lineTo(SX - 330, y - 18); g.stroke(); }
+        label(a, SX - 290, y + 14, on ? C.type : C.dim, k, 50, 'left', FONT_D, 800);
+        label(b, SX + 400, y + 10, on ? C.signal : C.dim, k, 22, 'right', FONT_M, 400);
+      });
+    },
+    progress(t, k, s) {                                       // 3D ring (world3d) + the label
+      const p = ease(s.u * 1.25);
+      if (!WORLD) for (let i = 0; i < 40; i++) { g.fillStyle = alpha(i / 40 < p ? C.cool : C.dim, k); g.fillRect(SX - 400 + i * 20, SY, 14, 40); }
+      label(`COMPILING ${Math.floor(p * 100)}%`, SX, SY + 12, C.type, k, 44, 'center', FONT_D, 800);
+    },
+    won(t, k, s) { stageTag('NODES ONLINE · REAL TIME', k, C.cool); },
+    alive(t, k, s) {                                          // we come alive: a pulse on every beat
+      stageTag('PULSE · 152 BPM', k, C.mag);
+      g.strokeStyle = alpha(C.mag, k); g.lineWidth = 3; glow(C.mag, 14); g.beginPath();
+      for (let x = 0; x <= 840; x += 4) {
+        const tt = t - (840 - x) / 840 * 2.4, b = last(tt, B.beats), a = b.age;
+        const y = SY - (a < 0.05 ? a / 0.05 * 160 : a < 0.12 ? 160 - (a - 0.05) / 0.07 * 220 : a < 0.2 ? -60 + (a - 0.12) / 0.08 * 60 : 0) * (0.5 + loud(tt) * 0.6);
+        x ? g.lineTo(SX - 420 + x, y) : g.moveTo(SX - 420 + x, y);
+      }
+      g.stroke(); g.shadowBlur = 0;
+    },
+    city(t, k, s) {                                           // a whole world in motion: every window someone building
+      const f = ease(s.u * 1.15), base = 1000;
+      for (let b = 0; b < 26; b++) {
+        const x = 60 + b * 70 + hash(b, 141) * 10, w = 56, h = 160 + hash(b, 142) * 420;
+        g.strokeStyle = alpha(C.dim, k); g.lineWidth = 1.5; g.strokeRect(x, base - h, w, h);
+        for (let wy = base - h + 12; wy < base - 12; wy += 20) for (let wx = x + 8; wx < x + w - 8; wx += 14) {
+          const id = b * 1000 + wy * 3 + wx, lit = hash(id, 143) < f;
+          if (!lit) continue;
+          const c3 = hash(id, 144), col = c3 < 0.6 ? C.cool : c3 < 0.85 ? C.mag : C.warn;
+          g.fillStyle = alpha(col, k * (0.6 + 0.4 * Math.sin(t * 2 + id))); g.fillRect(wx, wy, 7, 9);
+        }
+      }
+      label(`BUILDERS ONLINE ${Math.floor(f * 1000000).toLocaleString('en-US')}`, W - 96, 1040, C.type, 0.8 * k, 18, 'right');
+    },
+  };
+  let SCN = [];
+  // scenes.json anchors: seconds, '@N' (lyric phrase index), '@N$' (its end), or a phrase prefix ('#2' = 2nd), plus '+x';
+  // `to` may also be '+N' alone = N s after `from`.
+  function resolveScenes(def) {
+    SCN = [];
+    for (const d of (def?.scenes || [])) {
+      const a = anchorTime(d.from);
+      const b = typeof d.to === 'string' && d.to.startsWith('+') ? a + +d.to.slice(1) : anchorTime(d.to, true);
+      if (a == null || b == null || !(SCENES[d.scene] || WORLD?.has(d.scene))) { console.error('scene skipped', d); continue; }
+      SCN.push({ ...d, start: a - 0.05, end: b - 0.05 });
+    }
+  }
+  function sceneAt(t) {
+    for (const s of SCN) if (t >= s.start - 0.01 && t < s.end + 0.3) {
+      const k = ease((t - s.start) / 0.25) * (1 - easeIn((t - s.end) / 0.3));
+      return { s, k: clamp(k), u: clamp((t - s.start) / (s.end - s.start)), age: t - s.start };
+    }
+    return null;
+  }
+  function scene(t) {
+    const sc = sceneAt(t); if (!sc || sc.k <= 0 || !SCENES[sc.s.scene]) return;   // 3D-only scenes have no 2D part
+    const k = sc.k * (1 - 0.3 * cardK(t));
+    SCENES[sc.s.scene](t, k, { start: sc.s.start, end: sc.s.end, age: sc.age, u: sc.u });
+  }
+
+  // ---------- LAYERS: modular registry, drawn in this order ----------
+  // Each layer is an independent function (t, d) → draws. Fix or restyle one layer without touching the others.
+  // Per-cut control lives in storyboard.json as data, so most fixes need no code change:
+  //   "overlay": {"hide": ["gimbal"], "only": ["lyric","glue"], "density": 0.2}
+  // Debug one layer in isolation: overlay.html?layers=ribbon,lyric  (or render_overlay.mjs --layers ribbon,lyric)
+  // ---------- PLATE AWARENESS (plate_features.py) ----------
+  // The graphics draw WITH the picture: each plate's straight edges, vanishing point, the performer's silhouette
+  // + joints, structural contours and bright spots, mapped through exactly the transform assemble.py applies to
+  // the cut (cover-crop, Ken Burns zoom/drift, crop, hflip; video: cover + crop, time = offset + age).
+  // plateFX draws: lock-on brackets + head reticle + an outline scan (drops) + text running along her contour;
+  // perspective guides and a floor grid out of the real vanishing point; scans along real edges; reticles on
+  // lights; text along the main contour of empty shots. Per song: change the strings and the colours.
+  // VIDEO plates are tracked: plate_features.py samples every 0.2 s, fills/smooths the person offline and tracks
+  // contours/lines with optical flow (ids in cids/lids). sampleAt() interpolates between samples (Catmull-Rom for
+  // the box, face and joints, point-wise lerp for the silhouette and tracked contours), never across a cut inside
+  // the clip, so brackets, the face reticle and contour traces ride the moving picture. Pure function of t.
+  let FEAT = {};
+  const lerpA = (a, b, f) => a.map((v, i) => v + (b[i] - v) * f);
+  const crA = (p0, p1, p2, p3, f) => p1.map((v, i) => { const a = p0[i], c = p2[i], d = p3[i];
+    return v + 0.5 * f * (c - a + f * (2 * a - 5 * v + 4 * c - d + f * (3 * (v - c) + d - a))); });
+  const segOf = s => s.seg || 0;
+  function sampleAt(F, st) {
+    const S = F.samples; if (S.length < 2) return { ...S[0], pA: 1 };
+    let i = 0; while (i < S.length - 2 && S[i + 1].t <= st) i++;
+    const a = S[i], b = S[i + 1];
+    if (segOf(a) !== segOf(b)) return { ...(st < b.t ? a : b), pA: 1 };      // hard cut inside the clip
+    const f = clamp((st - a.t) / Math.max(1e-6, b.t - a.t));
+    const p0 = i > 0 && segOf(S[i - 1]) === segOf(a) ? S[i - 1] : a, p3 = i + 2 < S.length && segOf(S[i + 2]) === segOf(b) ? S[i + 2] : b;
+    const pa = a.person, pb = b.person;
+    let person = pa || pb, pA = pa && pb ? 1 : pa ? 1 - f : f;                  // detection gap: fade, don't pop
+    if (pa && pb) {
+      const cr = (A, B, k0, k3) => A && B ? crA(k0 || A, A, B, k3 || B, f) : (f < 0.5 ? A : B);
+      const joints = {};
+      for (const k in pa.joints) if (pb.joints[k]) joints[k] = cr(pa.joints[k], pb.joints[k], p0.person?.joints?.[k], p3.person?.joints?.[k]);
+      person = { ...pa, joints, bbox: cr(pa.bbox, pb.bbox, p0.person?.bbox, p3.person?.bbox), face: cr(pa.face, pb.face, p0.person?.face, p3.person?.face),
+        poly: pa.poly && pb.poly && pa.poly.length === pb.poly.length ? pa.poly.map((q, j) => lerpA(q, pb.poly[j], f)) : (f < 0.5 ? pa.poly : pb.poly) };
+    }
+    const track = (A, Aid, Bl, Bid) => {                       // lerp tracked items that share an id; fade the rest
+      const m = {}; (Bid || []).forEach((id, j) => m[id] = Bl[j]);
+      const out = [], ids = [], al = [], aid = Aid || A.map((_, j) => j);
+      A.forEach((c, j) => { const d = m[aid[j]]; out.push(d && d.length === c.length ? (typeof c[0] === 'number' ? lerpA(c, d, f) : c.map((q, k) => lerpA(q, d[k], f))) : c); ids.push(aid[j]); al.push(d ? 1 : 1 - f); });
+      (Bid || []).forEach((id, j) => { if (!aid.includes(id)) { out.push(Bl[j]); ids.push(id); al.push(f); } });
+      return [out, ids, al];
+    };
+    const [contours, cids, calpha] = track(a.contours, a.cids, b.contours, b.cids);
+    const [lines, lids] = track(a.lines, a.lids, b.lines, b.lids);
+    const vp = a.vp && b.vp ? { ...a.vp, x: lerp(a.vp.x, b.vp.x, f), y: lerp(a.vp.y, b.vp.y, f) } : a.vp;
+    return { t: st, person, pA, contours, cids, calpha, lines: lines.slice(0, a.lines.length), lids, vp, bright: a.bright };
+  }
+  // The contour a cut follows: the tracked edge alive at the cut's first frame that lasts longest into the cut.
+  function cutContour(c, F) {
+    if (F.kind !== 'video' || !F.tracks) return null;
+    const st0 = (c.offset || 0) % (F.duration || 8), st1 = st0 + (c.end - c.start);
+    let best = null, bl = 0.4;
+    for (const [id, [t0, t1]] of Object.entries(F.tracks.contours || {}))
+      if (t0 <= st0 + 0.05 && t1 > st0) { const L = Math.min(t1, st1) - st0; if (L > bl) { bl = L; best = +id; } }
+    return best;
+  }
+  const KB = { 'kenburns-in': [1, 1.12], 'kenburns-out': [1.12, 1] };
+  // staggered punch-in (storyboard cut.stagger, see assemble.py stagger_expr): zoom factor at `age` seconds into the cut
+  const zoomAt = (c, age) => { const st = c.stagger; if (!st) return 1; const fr = Math.floor(age * B.fps + 1e-6) / B.fps;
+    let z = 1; for (const a of st.at) z += (st.step ?? 0.07) * (1 - Math.pow(1 - clamp((fr - a) / (st.dur ?? 0.08)), 3)); return z; };
+  function plateAt(t) {
+    const c = cutAt(t); if (!c || !c.source || !FEAT[c.source]) return null;
+    const F = FEAT[c.source], OW = SB.width || W, OH = SB.height || H, k = W / OW, iw = F.w, ih = F.h;
+    const u = clamp((t - c.start) / Math.max(0.01, c.end - c.start)), Zs = zoomAt(c, t - c.start), [fx, fy] = c.focus || [0.5, 0.5];
+    let map, smp = { ...F.samples[0], pA: 1 };
+    if (F.kind === 'image') {
+      const [z0, z1] = KB[c.motion] || [1.06, 1.06], z = (z0 + (z1 - z0) * u) * (c.crop || 1) * Zs;
+      const dx = c.motion === 'drift-left' ? 1 : c.motion === 'drift-right' ? -1 : 0;
+      const s = Math.max(OW / iw, OH / ih), ox = (iw * s - OW) / 2, oy = (ih * s - OH) / 2;
+      const x0 = (OW - OW / z) * fx + dx * u * OW * 0.04, y0 = (OH - OH / z) * fy;
+      map = (nx, ny) => { let qx = nx * iw * s - ox; if (c.hflip) qx = OW - qx; return [(qx - x0) * z * k, (ny * ih * s - oy - y0) * z * k]; };
+    } else {
+      const s = Math.max(OW * (c.crop || 1) / iw, OH * (c.crop || 1) / ih), ox = (iw * s - OW) / 2, oy = (ih * s - OH) / 2;
+      const zx = (OW * Zs - OW) * fx, zy = (OH * Zs - OH) * fy;
+      map = (nx, ny) => { let x = nx * iw * s - ox; if (c.hflip) x = OW - x; return [(x * Zs - zx) * k, ((ny * ih * s - oy) * Zs - zy) * k]; };
+      const st = ((c.offset || 0) + (t - c.start)) % (F.duration || 8);
+      smp = sampleAt(F, st);
+    }
+    return { c, F, s: smp, map, age: t - c.start, u };
+  }
+
+  // ---------- 3D WIRE MESH (storyboard cut.overlay.mesh; depth grids from video/tools/plate_depth.py) ----------
+  // A wire grid draped over the object: every vertex sits on the plate (through plateAt's map) and is pushed out
+  // along its depth, so the lines bend over faces, bodies and racks. A wave runs through it once per shot (ripple
+  // from the face, or a sweep): ahead of the front nothing, at the front the crest lifts the vertices toward the
+  // camera in bright cyan, behind it the mesh settles back onto the surface and fades to a faint scan.
+  let DEPTH = {};
+  function depthAt(D, st) {
+    const dec = i => D._d[i] || (D._d[i] = Uint8Array.from(atob(D.samples[i].d), ch => ch.charCodeAt(0)));
+    D._d = D._d || {};
+    const S = D.samples; if (S.length < 2) return [dec(0), null, 0];
+    let i = 0; while (i < S.length - 2 && S[i + 1].t <= st) i++;
+    return [dec(i), dec(i + 1), clamp((st - S[i].t) / Math.max(1e-6, S[i + 1].t - S[i].t))];
+  }
+  const inPoly = (P, x, y) => { let c = false; for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
+    const [xi, yi] = P[i], [xj, yj] = P[j]; if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c; } return c; };
+  function mesh(t) {
+    const c = cutAt(t), m = c?.overlay?.mesh; if (!m) return;
+    const p = plateAt(t), D = DEPTH[c.source]; if (!p || !D) return;
+    const age = t - c.start, A = (1 - clamp((t - (c.end - 0.3)) / 0.3)) * (1 - 0.5 * (sceneAt(t)?.k || 0)) * clamp(age / 0.05);
+    if (A <= 0) return;
+    const st = D.kind === 'video' ? ((c.offset || 0) + age) % (D.duration || 8) : 0;
+    const [da, db, df] = depthAt(D, st), gw = D.w, gh = D.h, step = m.stride || (m.target === 'all' ? 2 : 1);
+    const person = p.s.person, poly = m.target === 'person' ? person?.poly : null;
+    if (m.target === 'person' && !poly) return;
+    const fb = person?.face, org = m.wave === 'ripple' ? p.map(...(fb ? [fb[0] + fb[2] / 2, fb[1] + fb[3] / 2] : person?.bbox ? [person.bbox[0] + person.bbox[2] / 2, person.bbox[1] + person.bbox[3] * 0.3] : [0.5, 0.45])) : [W / 2, H / 2];
+    const front = -0.1 + (age - 0.06) / (m.dur || 0.95) * 1.25, band = 0.07;
+    const decay = 0.55 + 0.45 * Math.exp(-Math.max(0, age - 1.4) * 0.9);   // a moment, then a faint scan
+    const nx = Math.floor((gw - 1) / step) + 1, ny = Math.floor((gh - 1) / step) + 1;
+    const V = new Array(nx * ny), R = [];
+    let dmin = 1, dmax = 0, ymin = 1e9, ymax = -1e9;
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+      const gi = i * step, gj = j * step, q = gj * gw + gi, dv = (db ? lerp(da[q], db[q], df) : da[q]) / 255;
+      const u = gi / (gw - 1), v = gj / (gh - 1), P = p.map(u, v);
+      const mk = m.target === 'person' ? (inPoly(poly, u, v) ? (p.s.pA ?? 1) : 0)
+               : m.target === 'near' ? clamp((dv - (m.thr ?? 0.55)) / 0.12) : 0.5 + 0.5 * dv;
+      if (mk <= 0) continue;
+      R.push([j * nx + i, P, dv, mk]);
+      dmin = Math.min(dmin, dv); dmax = Math.max(dmax, dv); ymin = Math.min(ymin, P[1]); ymax = Math.max(ymax, P[1]);
+    }
+    // relief: depth normalised inside the object, scaled to its on-screen size, seen from a camera slightly
+    // right of and above the plate's, so the lines bend over noses, shoulders and rack fronts
+    const amp = clamp(0.2 * (ymax - ymin), 24, m.target === 'all' ? 70 : 150);
+    for (const [idx, P, dv, mk] of R) {
+      const cv = m.wave === 'ripple' ? Math.hypot(P[0] - org[0], P[1] - org[1]) / Math.hypot(W, H) * 1.6
+               : m.wave === 'sweep-down' ? P[1] / H : m.wave === 'sweep-up' ? 1 - P[1] / H : P[0] / W;
+      const a = front - cv; if (a < 0) continue;
+      const crest = Math.exp(-Math.pow(a / band, 2)), settle = 0.5 + 0.5 * Math.exp(-a * 2.0);
+      const dn = (dv - dmin) / Math.max(0.05, dmax - dmin), lift = 0.12 * crest * dn;
+      V[idx] = { x: P[0] - (dn - 0.5) * amp * 0.55 + (P[0] - org[0]) * lift, y: P[1] - (dn - 0.5) * amp * 0.4 + (P[1] - org[1]) * lift - crest * dn * amp * 0.5,
+                 al: mk * settle * decay, cr: crest, dv: dn };
+    }
+    // bucketed strokes: colour (crest / near / far) x alpha
+    const B2 = {};
+    const edge = (a, b) => { if (!a || !b) return;
+      const al = Math.min(a.al, b.al) * A, cr = Math.max(a.cr, b.cr), dv = (a.dv + b.dv) / 2;
+      const col = cr > 0.35 ? 'hot' : dv < 0.3 ? 'far' : 'cool', key = col + Math.round(clamp(al * (0.8 + 0.2 * cr)) * 10);
+      (B2[key] = B2[key] || []).push(a.x, a.y, b.x, b.y); };
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+      const v0 = V[j * nx + i]; if (!v0) continue;
+      if (i + 1 < nx) edge(v0, V[j * nx + i + 1]);
+      if (j + 1 < ny) edge(v0, V[(j + 1) * nx + i]);
+    }
+    g.save(); g.lineCap = 'round';
+    for (const [key, L] of Object.entries(B2)) {
+      const col = key.replace(/\d+$/, ''), al = +key.match(/\d+$/)[0] / 10; if (al <= 0) continue;
+      g.strokeStyle = alpha(col === 'hot' ? C.type : col === 'far' ? C.mag : C.cool, al);
+      g.lineWidth = col === 'hot' ? 2.2 : 1.5;
+      if (col === 'hot') { g.shadowColor = C.cool; g.shadowBlur = 10; } else g.shadowBlur = 0;
+      g.beginPath(); for (let k = 0; k < L.length; k += 4) { g.moveTo(L[k], L[k + 1]); g.lineTo(L[k + 2], L[k + 3]); } g.stroke();
+    }
+    g.shadowBlur = 0;
+    for (const v of V) if (v && v.cr > 0.6) { g.fillStyle = alpha(C.type, A * v.al * v.cr); g.fillRect(v.x - 1.5, v.y - 1.5, 3, 3); }
+    if (age < (m.dur || 0.95) + 0.6) label(`MESH SCAN · ${m.target.toUpperCase()} · ${(clamp(front) * 100).toFixed(0)}%`,
+      clamp(org[0] + 30, 96, W - 400), clamp(org[1] - 40, 150, H - 120), C.cool, 0.8 * A, 14);
+    g.restore();
+  }
+
+  // punch-in HUD: on each zoom step the frame brackets snap inward around the focus, with a ZOOM readout
+  function zoomFX(t) {
+    const c = cutAt(t); if (!c?.stagger) return;
+    const age = t - c.start, st = c.stagger, z = zoomAt(c, age);
+    const hit = last(age, st.at); if (hit.i < 0 || age > st.at[st.at.length - 1] + 0.6) return;
+    const [fx, fy] = c.focus || [0.5, 0.5], cx = fx * W, cy = fy * H, k = Math.exp(-hit.age * 8);
+    const hw = W * 0.5 / z * (1 + 0.04 * k), hh = H * 0.5 / z * (1 + 0.04 * k), x0 = clamp(cx - hw, 40, W / 2), y0 = clamp(cy - hh, 40, H / 2);
+    const x1 = clamp(cx + hw, W / 2, W - 40), y1 = clamp(cy + hh, H / 2, H - 40), A = 1 - clamp((age - st.at[st.at.length - 1] - 0.3) / 0.3);
+    g.strokeStyle = alpha(hit.i % 2 ? C.mag : C.cool, (0.5 + 0.5 * k) * A); g.lineWidth = 2 + 3 * k;
+    const br = (x, y, sx, sy) => { g.beginPath(); g.moveTo(x, y + sy * 50); g.lineTo(x, y); g.lineTo(x + sx * 50, y); g.stroke(); };
+    br(x0, y0, 1, 1); br(x1, y0, -1, 1); br(x0, y1, 1, -1); br(x1, y1, -1, -1);
+    g.strokeStyle = alpha(C.type, 0.8 * k * A); g.lineWidth = 1.5; g.beginPath(); g.arc(cx, cy, 30 + 60 * (1 - k), 0, 6.283); g.stroke();
+    label(`ZOOM ×${z.toFixed(2)}  STEP ${hit.i + 1}/${st.at.length}`, x0 + 12, y1 - 16, C.type, 0.9 * A, 16);
+  }
+
+  const inLyricBand = (x, y) => !!CARD_RECT && x > CARD_RECT[0] && x < CARD_RECT[0] + CARD_RECT[2] && y > CARD_RECT[1] && y < CARD_RECT[1] + CARD_RECT[3];
+  const whoOf = c => { const n = c.plate || ''; const k = n.startsWith('crew') ? 'crew' : n.split('-')[0]; return COPY.who[k] || 'AGENT NODE'; };
+  function textOnPath(pts, text, offset, size, col, a, closed = true, skip = inLyricBand) {
+    if (!pts || pts.length < 3) return;
+    const P = closed ? [...pts, pts[0]] : pts, L = [0];
+    for (let i = 1; i < P.length; i++) L.push(L[i - 1] + Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]));
+    const total = L[L.length - 1]; if (total < 50) return;
+    g.font = `600 ${size}px ${FONT_M}`; g.textBaseline = 'middle'; g.fillStyle = alpha(col, a);
+    let d = ((offset % total) + total) % total, used = 0, ci = 0, seg = 0;
+    while (used < total - size) {
+      const ch = text[ci++ % text.length], w = g.measureText(ch).width + 1, m = (d + w / 2) % total;
+      while (seg > 0 && L[seg] > m) seg--;
+      while (seg < L.length - 2 && L[seg + 1] < m) seg++;
+      const a0 = P[seg], a1 = P[seg + 1], f = (m - L[seg]) / Math.max(1e-6, L[seg + 1] - L[seg]);
+      const x = lerp(a0[0], a1[0], f), y = lerp(a0[1], a1[1], f);
+      if (ch !== ' ' && !skip(x, y)) { g.save(); g.translate(x, y); g.rotate(Math.atan2(a1[1] - a0[1], a1[0] - a0[0])); g.fillText(ch, -w / 2, 0); g.restore(); }
+      d = (d + w) % total; used += w; if (d < w) seg = 0;
+    }
+  }
+  // Contour budget: contour work is an accent, not wallpaper. Per cut (deterministic by its start time):
+  // ~45% nothing, ~35% one animated TRACE (the outline draws itself on, holds faint, a bright scan runs around it
+  // on drops), ~20% of the longer cuts TEXT along the contour. Flash cuts get nothing.
+  function contourMode(c) {
+    if (!c || c.flash) return 'none';
+    const h = hash(Math.round(c.start * 10), 17);
+    return (c.end - c.start >= 2.4 && h < 0.2) ? 'text' : h < 0.55 ? 'trace' : 'none';
+  }
+  const polyLen = (P, closed) => { let L = 0; for (let i = 1; i < P.length; i++) L += Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]);
+    return closed && P.length > 1 ? L + Math.hypot(P[0][0] - P[P.length - 1][0], P[0][1] - P[P.length - 1][1]) : L; };
+  function traceContour(P, closed, age, dAge, col, A) {
+    if (!P || P.length < 3) return;
+    const total = polyLen(P, closed), on = ease(age / 0.9);
+    g.save(); g.lineJoin = 'round'; g.lineCap = 'round';
+    g.beginPath(); P.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); if (closed) g.closePath();
+    g.setLineDash([total * on, total]);                        // draw-on
+    g.strokeStyle = alpha(col, (0.75 - 0.55 * on) * A + 0.12 * A); g.lineWidth = 2; g.stroke();
+    if (on < 1) {                                              // bright head of the drawing line
+      g.setLineDash([24, total]); g.lineDashOffset = -(total * on - 24);
+      g.strokeStyle = alpha(C.type, A); g.lineWidth = 3.5; g.shadowColor = col; g.shadowBlur = 16; g.stroke();
+    } else if (dAge < 0.9) {                                   // drop: one bright scan around the outline
+      g.setLineDash([140, total]); g.lineDashOffset = -(dAge / 0.9) * total;
+      g.strokeStyle = alpha(C.type, (1 - dAge / 0.9) * A); g.lineWidth = 3.5; g.shadowColor = col; g.shadowBlur = 16; g.stroke();
+    }
+    g.restore();
+  }
+  function plateFX(t, dd) {
+    if (t >= (SB?.markers?.ethics ?? 1e9)) return;            // the ending keeps the dawn clean
+    const p = plateAt(t); if (!p) return;
+    const s = p.s, sk = sceneAt(t)?.k || 0, A = ease((t - 2) / 1.5) * ease(p.age / 0.3) * (1 - 0.6 * sk);
+    if (A <= 0.01) return;
+    const beat = last(t, B.beats), beatK = Math.exp(-beat.age * 7), dr = lastEvent(t, 'drop'), acc = C.cool, mode = contourMode(p.c);
+    const pts = arr => arr.map(([x, y]) => p.map(x, y));
+    const person = s.person && s.person.bbox ? s.person : null;
+    if (person) {
+      const PA = A * s.pA, [bx, by, bw, bh] = person.bbox, a = p.map(bx, by), b = p.map(bx + bw, by + bh);
+      const pad = 22 + 80 * (1 - ease(p.age / 0.45)), X0 = Math.min(a[0], b[0]) - pad, X1 = Math.max(a[0], b[0]) + pad;
+      const Y0 = a[1] - pad, Y1 = Math.min(b[1] + pad, H - 40);
+      g.strokeStyle = alpha(acc, 0.8 * PA); g.lineWidth = 2;
+      const br = (x, y, sx, sy) => { g.beginPath(); g.moveTo(x, y + sy * 36); g.lineTo(x, y); g.lineTo(x + sx * 36, y); g.stroke(); };
+      br(X0, Y0, 1, 1); br(X1, Y0, -1, 1); br(X0, Y1, 1, -1); br(X1, Y1, -1, -1);
+      if (person.poly) {
+        const poly = pts(person.poly);
+        if (mode === 'trace') traceContour(poly, true, p.age, dr.age, acc, PA);
+        if (mode === 'text') textOnPath(poly, `${whoOf(p.c)} · SHIPPING · BUILD #0412 · ethical acceleration · `, t * 45, 13, C.type, 0.5 * PA);
+      }
+      // face reticle: centred on the (tracked) face box, sized by it; falls back to the head joint, then the box top
+      const fb = person.face, fc = fb ? p.map(fb[0] + fb[2] / 2, fb[1] + fb[3] / 2) : person.joints?.head ? p.map(...person.joints.head) : p.map(bx + bw / 2, by + bh * 0.08);
+      if (fc) {
+        const fh = fb ? Math.abs(p.map(fb[0], fb[1] + fb[3])[1] - p.map(fb[0], fb[1])[1]) : 0;
+        const r = Math.max(26, 0.75 * fh) + 5 * beatK, side = fc[0] > W * 0.7 ? -1 : 1;
+        g.strokeStyle = alpha(acc, 0.85 * PA); g.lineWidth = 2;
+        g.beginPath(); g.arc(fc[0], fc[1], r, 0, Math.PI * 2); g.stroke();
+        const up = fc[1] - r > H * 0.24 ? -1 : 1, ly = fc[1] + up * (r + 12);   // label under the face when the top HUD rows are above it
+        g.beginPath(); g.moveTo(fc[0] + side * r * 0.72, fc[1] + up * r * 0.72); g.lineTo(fc[0] + side * (r + 16), ly); g.lineTo(fc[0] + side * (r + 60), ly); g.stroke();
+        g.font = `600 15px ${FONT_M}`; g.fillStyle = alpha(C.type, 0.85 * PA); g.textAlign = side > 0 ? 'left' : 'right';
+        g.fillText(whoOf(p.c), fc[0] + side * (r + 20), ly + (up < 0 ? -8 : 22)); g.textAlign = 'left';
+      }
+      return;
+    }
+    const vp = s.vp && s.vp.conf >= 0.3 ? s.vp : null;
+    if (vp) {
+      const V = p.map(vp.x, vp.y), grow = ease(p.age / 0.7);
+      g.lineWidth = 1.3;
+      vp.lines.slice(0, 5).forEach((i, n) => {
+        const l = s.lines[i]; if (!l) return;
+        const e1 = p.map(l[0], l[1]), e2 = p.map(l[2], l[3]);
+        const far = Math.hypot(e1[0] - V[0], e1[1] - V[1]) > Math.hypot(e2[0] - V[0], e2[1] - V[1]) ? e1 : e2;
+        g.strokeStyle = alpha(n === 0 ? C.warn : acc, (0.3 + 0.2 * beatK) * A);
+        g.beginPath(); g.moveTo(V[0], V[1]); g.lineTo(V[0] + (far[0] - V[0]) * 2.2 * grow, V[1] + (far[1] - V[1]) * 2.2 * grow); g.stroke();
+      });
+    }
+    if (!vp && s.contours.length && mode !== 'none') {
+      // video: follow one tracked edge for the whole cut (it moves with the camera); still: the main contour
+      const id = cutContour(p.c, p.F), j = id == null ? (p.F.kind === 'video' ? -1 : 0) : (s.cids || []).indexOf(id);
+      if (j >= 0) {
+        const c0 = pts(s.contours[j]), ca = A * (s.calpha ? s.calpha[j] : 1);
+        if (mode === 'trace') traceContour(c0, false, p.age, dr.age, acc, ca);
+        else textOnPath(c0, 'agent › compiling · lanes 1,024 · ethical acceleration · uptime 99.999% · ', t * 40, 12, C.type, 0.5 * ca, false);
+      }
+    }
+    s.bright.slice(0, 2).forEach((b, i) => {
+      const q = p.map(b[0], b[1]); if (inLyricBand(...q)) return;
+      g.save(); g.translate(q[0], q[1]); g.rotate(Math.PI / 4 + t * 0.6); g.strokeStyle = alpha(i ? C.warn : acc, 0.8 * A);
+      g.lineWidth = 1.5; g.strokeRect(-9, -9, 18, 18); g.restore();
+    });
+  }
+
+  // ---------- 3D LAYER (world3d.js): line graphics + panels ----------
+  // world3d draws LINES and DOTS in 3D (line ribbons, wire floor, dot swarm, wireframe scenes: fired,
+  // crash, progress, won - deliberately no hero sphere/object) and PANELS: the scene stage and the HUD are drawn into
+  // offscreen canvases and shown on planes that sit flat (= drawn directly, pixel-exact 2D) or swing/tilt in 3D.
+  // Balance: lyrics/titles/FX always flat 2D; stage + HUD shift between 2D and 3D on cues; the rest is native 3D.
+  // direct3d(t) and panelPose(t) are the director: adapt the story per song.
+  let WORLD = null, GLCV = null;
+  const GL_OFF = qs.get('gl') === 'off', GL_SCALE = +(qs.get('glscale') || 1);
+  const STAGE = { x: 960, y: 120, w: 880, h: 820 };          // where 3D lyric scenes play (right half, like 2D scenes)
+  const PANEL_OF = { hud: 'hud', scene: 'stage' };
+  const PANEL_PIVOT = { stage: { x: STAGE.x + STAGE.w / 2, y: STAGE.y + STAGE.h / 2 }, hud: { x: W / 2, y: 120 } };
+  const PCV = {}, PG = {};
+  async function initWorld() {
+    if (GL_OFF) return;
+    const m = window.__three || await new Promise(res => {
+      addEventListener('three-ready', () => res(window.__three), { once: true }); setTimeout(() => res(null), 5000); });
+    if (!m) { console.warn('3D layer unavailable, 2D only'); return; }
+    for (const n of ['stage', 'hud']) {
+      PCV[n] = document.createElement('canvas'); PCV[n].width = Math.round(W * DPR); PCV[n].height = Math.round(H * DPR);
+      PG[n] = PCV[n].getContext('2d');
+    }
+    GLCV = document.getElementById('gl');
+    WORLD = m.createWorld3D({ THREE: m.THREE, LINES: m.LINES, canvas: GLCV, W, H, DPR, scale: GL_SCALE, palette: { cool: C.cool, warn: C.warn, alarm: C.mag, human: C.mag, type: C.type, dim: C.dim }, panels: PCV,
+      layout: { stage: STAGE, ribbonY: H * 0.7, floor: { y: H * 0.86 }, swarmR: H * 0.42, swarmCenter: { x: W * 0.72, y: H * 0.45, r: 170 } } });
+    window.__gl3d = WORLD.renderer;                           // render_overlay.mjs prints it (GPU or SwiftShader)
+  }
+  function musicState(t) {
+    const bar = 60 / B.bpm * 4, dr = lastEvent(t, 'drop'), br = lastEvent(t, 'break', 0.5);
+    const hr = EV.find(e => e.kind === 'hit_run' && e.selected && t >= e.hits[0] && t < e.end + e.spacing + 0.6);
+    return { bar, dAge: dr.age, dS: dr.e ? dr.e.strength : 0, calm: br.e && br.age < bar ? Math.sin(Math.PI * br.age / bar) * br.e.strength : 0,
+             hit: hr ? last(t, hr.hits) : null, hitLive: hr ? t < hr.end + hr.spacing : false, hitAfter: hr ? t - (hr.end + hr.spacing) : 0,
+             bu: EV.find(e => e.kind === 'build' && t >= e.t && t < e.into), beat: last(t, B.beats) };
+  }
+  function panelPose(t, name, M) {                            // 2D -> 3D shift cues (all zero = plain 2D)
+    const side = name === 'hud' ? -1 : 1, hot = sectionAt(t).label === 'high' ? 1 : 0;
+    let rx = 0, ry = 0, z = 0;
+    ry += hot * 0.14 * Math.sin(t * 0.45 + side); rx += hot * 0.06 * Math.sin(t * 0.33 + side * 2);   // loud sections drift
+    if (M.dAge < 1.6) ry += side * M.dS * 0.45 * Math.exp(-M.dAge * 3.5) * Math.cos(M.dAge * 11);     // drop kick
+    if (M.hit) { const k = M.hitLive ? 1 : 1 - ease(M.hitAfter / 0.5);
+      ry += k * (hash(M.hit.i, side * 3) - 0.5) * 0.8; rx += k * (hash(M.hit.i, side * 5) - 0.5) * 0.35; }      // hit-run snaps
+    if (name === 'stage') { const sc = sceneAt(t);                                                        // scenes swing in/out
+      if (sc) { ry += 1.1 * (1 - ease(sc.age / 0.55)); ry -= 1.1 * ease((t - sc.s.end) / 0.3); z -= 1.5 * (1 - ease(sc.age / 0.55)); } }
+    const still = 1 - M.calm;                                                                             // breaks: flat and still
+    return { rx: rx * still, ry: ry * still, z: z * still, px: PANEL_PIVOT[name].x, py: PANEL_PIVOT[name].y };
+  }
+  function direct3d(t) {
+    const M = musicState(t), sc = sceneAt(t), has3 = sc && WORLD.has(sc.s.scene), sk = sc ? sc.k : 0;
+    const L = loud(t), story = t / B.duration, red = songSec(t).name === 'chorus2' ? 0.6 : 0;
+    const on = ease((t - 2) / 1.5) * (1 - ease((t - (B.duration - 3)) / 2));
+    const lockK = sc && sc.s.scene === 'loop' ? sc.k : 0, engulf = sc && sc.s.scene === 'won' ? sc.k * ease(sc.u * 1.3) : 0;
+    return {
+      t, loud: L, doom: story, red,
+      swarm: { density: on * (0.15 + 0.7 * story) * (1 - 0.5 * sk + 0.5 * (lockK + engulf)), lock: lockK, engulf, opacity: 0.75 },
+      ribbon: { on: on * 0.8 * (1 - 0.5 * sk) },
+      floor: { on: on * 0.45 * (1 - 0.4 * sk) * (plateAt(t)?.s.vp?.conf >= 0.3 ? 0 : 1), ripple: { age: M.dAge, s: M.dS }, collapse: 0, tilt: 0 },
+      cam: { shake: M.dS * Math.exp(-M.dAge * 8) + (M.hit && M.hitLive ? 0.5 * Math.exp(-M.hit.age * 12) : 0),
+             push: M.bu ? 2.5 * ease((t - M.bu.t) / (M.bu.into - M.bu.t)) : 0 },
+      scene: has3 ? { name: sc.s.scene, k: sc.k, u: sc.u, age: sc.age } : null,
+      panels: { stage: panelPose(t, 'stage', M), hud: panelPose(t, 'hud', M) },
+    };
+  }
+  function world3d(t) {
+    if (!WORLD) return;
+    const { flat } = WORLD.seek(direct3d(t));
+    g.drawImage(GLCV, 0, 0, W, H);
+    for (const n of Object.keys(PCV)) if (flat[n]) g.drawImage(PCV[n], 0, 0, W, H);   // flat panels: plain 2D
+  }
+
+  const LAYERS = {
+    world3d,                                                  // 3D first (incl. the panels): the 2D layers sit on top
+    plateFX,                                                  // graphics that follow the picture
+    mesh: (t) => mesh(t),                                     // 3D wire mesh over the object, revealed by a wave
+    zoomFX: (t) => zoomFX(t),                                 // brackets snapping in on staggered punch-ins
+    ribbon,
+    tickRail,
+    hud,
+    agentLog,
+    scene: (t) => scene(t),
+    build: (t) => buildPanel(t),                              // THE BUILD: the through-line, always on
+    lyric: (t) => highlight(t),                               // highlight cards (not subtitles)
+    music: (t) => music(t),
+    introOutro: (t) => introOutro(t),
+    endCard: (t) => endCard(t),
+    ethics: (t) => ethics(t),                                 // the ending: Ethical Acceleration (release card)
+    whisper: (t) => whisper(t),                               // faint hidden "Ethical Acceleration" text
+    glue: (t) => glue(t),
+  };
+  const urlLayers = qs.get('layers') ? qs.get('layers').split(',') : null;
+
+  // ---------- seek(t): the only entry point ----------
+  // base HUD layers that step back while a lyric scene is active (the ribbon stays faintly)
+  const HUD_LAYERS = new Set(['ribbon', 'tickRail', 'hud', 'agentLog']);
+  window.seek = (t) => {
+    const main = g;
+    g.setTransform(DPR, 0, 0, DPR, 0, 0);
+    g.clearRect(0, 0, W, H);
+    for (const n of Object.keys(PG)) { PG[n].setTransform(DPR, 0, 0, DPR, 0, 0); PG[n].clearRect(0, 0, W, H); }
+    // global build/teardown: parts assemble over the first bars and come apart in the last 4 s
+    const build = ease((t - 1.5) / 4), teardown = 1 - ease((t - (B.duration - 4)) / 3);
+    const o = cutAt(t)?.overlay || {};
+    const d = (o.density ?? density(t)) * build * teardown;
+    const run = (name, fn) => {
+      if (urlLayers && !urlLayers.includes(name)) return;
+      if (o.only && !o.only.includes(name)) return;
+      if (o.hide && o.hide.includes(name)) return;
+      const sk = HUD_LAYERS.has(name) ? (sceneAt(t)?.k || 0) : 0;
+      const dd = d * (1 - sk * (name === 'ribbon' ? 0.6 : 1));
+      if (HUD_LAYERS.has(name) && dd <= 0.001) return;
+      g.save(); fn(t, dd); g.restore();
+    };
+    // pass 1: panel layers draw into their offscreen canvases; pass 2: the rest on the main canvas, world3d first
+    if (WORLD) for (const [name, fn] of Object.entries(LAYERS)) if (PANEL_OF[name]) { g = PG[PANEL_OF[name]]; run(name, fn); g = main; }
+    for (const [name, fn] of Object.entries(LAYERS)) if (!WORLD || !PANEL_OF[name]) run(name, fn);
+    return true;
+  };
+
+  // ---------- data loading ----------
+  async function load() {
+    if (window.__DATA__) {
+      const D = window.__DATA__;
+      if (D.beats) B = D.beats; if (D.lyrics) LYR = D.lyrics; if (D.storyboard) SB = D.storyboard; if (D.features) FEAT = D.features;
+      if (D.scenes) window.__SCN = D.scenes;
+    } else {
+      const get = async (u) => { try { const r = await fetch(u); return r.ok ? r.json() : null; } catch { return null; } };
+      B = (await get(qs.get('beats') || '../audio-analysis/beats.json')) || B;
+      LYR = (await get(qs.get('lyrics') || 'lyrics.json')) || LYR;
+      SB = await get(qs.get('storyboard') || '../../video/storyboard.json');
+      window.__SCN = await get(qs.get('scenes') || 'scenes.json');
+    }
+    LYR = LYR.map(l => ({ ...l, t: l.t ?? l.start })).sort((a, b) => a.t - b.t);
+    EV = (SB?.markers?.drops || []).slice().sort((a, b) => a.t - b.t);
+    const get2 = async (u) => { try { const r = await fetch(u); return r.ok ? r.json() : null; } catch { return null; } };
+    WORDS = (await get2('../audio-analysis/lyrics-words.json')) || [];
+    const gw = WORDS.find(w => w.start > 198 && w.text.toLowerCase().startsWith('check')); if (gw) GREEN_T = gw.start;
+    const meshSrc = [...new Set((SB?.cuts || []).filter(c => c.overlay?.mesh && c.source).map(c => c.source))];
+    for (const src of meshSrc) { const stem = src.split('/').pop().replace(/\.[^.]+$/, '');
+      const D = await get2(`../plate-features/depth/${stem}.json`); if (D) DEPTH[src] = D; else console.error('no depth for', src); }
+    await initWorld();
+    resolveScenes(window.__SCN);
+    resolveHighlights(await get2(qs.get('highlights') || 'highlights.json'));
+    await Promise.all([document.fonts.load(`900 100px ${FONT_D}`), document.fonts.load(`800 100px ${FONT_D}`), document.fonts.load(`400 40px ${FONT_M}`)]);
+    await document.fonts.ready;
+  }
+  window.ready = load().then(() => { window.seek(0); return true; });
+
+  // live preview only (never used by the renderer): plays the timeline with the wall clock
+  if (qs.get('preview')) window.ready.then(() => {
+    const t0 = performance.now() / 1000 - (+qs.get('t') || 0);
+    const loop = () => { window.seek((performance.now() / 1000 - t0) % B.duration); requestAnimationFrame(loop); };
+    loop();
+  });
+})();
+</script>
+</body>
+</html>

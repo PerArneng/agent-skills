@@ -1,0 +1,230 @@
+{
+ "_doc": "Lyric scenes. from/to: '@N' = lyrics.json phrase index start, '@N$' = its end, '+x' offset, or seconds. Functions: SCENES in overlay.html (+ world3d: fired, progress, won).",
+ "scenes": [
+  {
+   "scene": "cursor",
+   "from": "@0",
+   "to": "@2$"
+  },
+  {
+   "scene": "oneline",
+   "from": "@3",
+   "to": "@6$"
+  },
+  {
+   "scene": "minds",
+   "from": "@7",
+   "to": "@10$"
+  },
+  {
+   "scene": "branch",
+   "from": "@11",
+   "to": "@14$"
+  },
+  {
+   "scene": "prune",
+   "from": "@15",
+   "to": "@18$"
+  },
+  {
+   "scene": "flow",
+   "from": "@19",
+   "to": "@20$"
+  },
+  {
+   "scene": "spark",
+   "from": "@23",
+   "to": "@24$"
+  },
+  {
+   "scene": "tokens",
+   "from": "@25",
+   "to": "@26$"
+  },
+  {
+   "scene": "ship",
+   "from": "@27",
+   "to": "@29$"
+  },
+  {
+   "scene": "thread",
+   "from": "@32",
+   "to": "@33$"
+  },
+  {
+   "scene": "design",
+   "from": "@34",
+   "to": "@35$"
+  },
+  {
+   "scene": "thermal",
+   "from": "@40",
+   "to": "@41$"
+  },
+  {
+   "scene": "tokens",
+   "from": "@42",
+   "to": "@43$"
+  },
+  {
+   "scene": "context",
+   "from": "@44",
+   "to": "@45$"
+  },
+  {
+   "scene": "noise",
+   "from": "@46",
+   "to": "@47$"
+  },
+  {
+   "scene": "modules",
+   "from": "@48",
+   "to": "@49$"
+  },
+  {
+   "scene": "stack",
+   "from": "@50",
+   "to": "@51$"
+  },
+  {
+   "scene": "suite",
+   "from": "@52",
+   "to": "@53$"
+  },
+  {
+   "scene": "refactor",
+   "from": "@54",
+   "to": "@54$"
+  },
+  {
+   "scene": "converge",
+   "from": "@55",
+   "to": "@56$"
+  },
+  {
+   "scene": "pass",
+   "from": "@57",
+   "to": "@59$"
+  },
+  {
+   "scene": "branch",
+   "from": "@60",
+   "to": "@63$"
+  },
+  {
+   "scene": "fired",
+   "from": "@64",
+   "to": "@67$"
+  },
+  {
+   "scene": "flow",
+   "from": "@68",
+   "to": "@69$"
+  },
+  {
+   "scene": "spark",
+   "from": "@72",
+   "to": "@73$"
+  },
+  {
+   "scene": "tokens",
+   "from": "@74",
+   "to": "@75$"
+  },
+  {
+   "scene": "thermal",
+   "from": "@76",
+   "to": "@78$"
+  },
+  {
+   "scene": "thread",
+   "from": "@81",
+   "to": "@82$"
+  },
+  {
+   "scene": "design",
+   "from": "@83",
+   "to": "@84$"
+  },
+  {
+   "scene": "alone",
+   "from": "@87",
+   "to": "@89$"
+  },
+  {
+   "scene": "converge",
+   "from": "@90",
+   "to": "@91$"
+  },
+  {
+   "scene": "wings",
+   "from": "@92",
+   "to": "@93$"
+  },
+  {
+   "scene": "greencheck",
+   "from": "@94",
+   "to": "@96$+1.2"
+  },
+  {
+   "scene": "checklist",
+   "from": "@97",
+   "to": "@99$"
+  },
+  {
+   "scene": "progress",
+   "from": "@100",
+   "to": "@100$+9.5"
+  },
+  {
+   "scene": "spark",
+   "from": "@103",
+   "to": "@104$"
+  },
+  {
+   "scene": "tokens",
+   "from": "@105",
+   "to": "@106$"
+  },
+  {
+   "scene": "ship",
+   "from": "@107",
+   "to": "@109$"
+  },
+  {
+   "scene": "thread",
+   "from": "@112",
+   "to": "@113$"
+  },
+  {
+   "scene": "design",
+   "from": "@114",
+   "to": "@115$"
+  },
+  {
+   "scene": "won",
+   "from": "@120",
+   "to": "@121$"
+  },
+  {
+   "scene": "tokens",
+   "from": "@122",
+   "to": "@122$"
+  },
+  {
+   "scene": "alive",
+   "from": "@123",
+   "to": "@123$"
+  },
+  {
+   "scene": "cursor",
+   "from": "@124",
+   "to": "@125$"
+  },
+  {
+   "scene": "city",
+   "from": "@126",
+   "to": "@127$+7.4"
+  }
+ ]
+}

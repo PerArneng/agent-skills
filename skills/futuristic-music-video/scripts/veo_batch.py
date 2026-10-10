@@ -65,12 +65,15 @@ for n in names:
     failed.append(n)
     if re.search(r"ClientError: 402|\b402 [A-Z_]{4,}|PAYMENT_REQUIRED", log):   # not a bare "402" (traceback line numbers)
         print("402: prepaid credits are used up — top up the Gemini billing account, then re-run."); break
+    if "spending cap" in log or "spend cap" in log:          # also a 429, but waiting won't help
+        print("429: the Gemini project hit its MONTHLY SPENDING CAP — raise it at https://ai.studio/spend, then re-run.")
+        break
     if "429" in log or "RESOURCE_EXHAUSTED" in log:
         quota += 1
         print(f"{n}: quota error ({quota}/{a.max_quota_fails})")
         if quota >= a.max_quota_fails:
-            print("stopping: daily Veo request quota reached. Re-run the same command after it resets (~24 h);"
-                  " finished plates are skipped.")
+            print("stopping: Veo request quota (per-minute or per-day) reached. Re-run the same command later;"
+                  " finished plates are skipped.\n" + log.strip().splitlines()[-1][:300])
             break
     elif "filtered" in log:
         print(f"{n}: rejected by the safety filter (not charged) — reword the motion prompt or use another still")

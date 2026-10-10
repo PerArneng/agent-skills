@@ -170,7 +170,7 @@ Only one contour per shot, and nothing on flash cuts. Performer shots get bracke
 To check the features, draw them on the stills once (lines, VP, silhouette, joints, contours, bright spots) and look before relying on them. Detection is good on clean AI stills; reject a VP below ~0.3 confidence.
 
 ## Highlight lyrics: implementation API
-The guidelines (when, how often, which style, layout, fonts, pitfalls) are in `references/lyric-typography.md`. The worked code is the Agents in the Loop Short (`youtube-shorts/assets/overlay/overlay.html`).
+The guidelines (when, how often, which style, layout, fonts, pitfalls) are in `references/lyric-typography.md`. The worked code ships with the skill: `assets/examples/compile-the-future/overlay.html` (`highlight`, `typeCard`, `flapCard`, `slamCard`, `anchorCard`, `charTimes`, with `highlights.json` next to it).
 - **Data:** `assets/overlay/highlights.json` holds `{cards: [{from, to?, style, text?, pos?, y?, rows?, title?, atWord?, anchor?, color?, size?, hold?}]}`. `from`/`to` are lyric-phrase prefixes (`#n` = nth occurrence), resolved against `lyrics.json` like `scenes.json`, so cards follow timing fixes. `load()` also fetches `../audio-analysis/lyrics-words.json`.
 - **Resolution:** `resolveHighlights` gives each card `t0`/`t1`, its words, and `toks`/`tt`: the per-token [start, end], using the sung words when the counts match.
 - **Timing:**

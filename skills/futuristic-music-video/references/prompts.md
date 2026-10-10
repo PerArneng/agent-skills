@@ -117,3 +117,6 @@ Read the result to check the spelling, then check it shrunk to ~246 px wide (sea
 
 ## Negative phrasing that works
 Models follow "Do not add text, signs or logos" better than a long list of everything banned. Keep the ban list in the bible, and in each prompt restate only: no text, no new people/objects, no style drift.
+
+## Words that turn into objects (Veo)
+Veo renders nouns literally and picks the most common reading. "cursor" became a white mouse-pointer hand moving across the lens; "screen" invites UI text; "signs of life" invites signage. Describe the visual form instead ("a solid rectangular text-cursor block that blinks"), then ban the misreading explicitly ("no mouse pointer, no arrow, no hand icon, no new shapes appear"). Re-check the clip after any noun that could be an icon.

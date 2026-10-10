@@ -46,7 +46,18 @@ GRADES = {
     "none": "null",
 }
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp"}
-RENDER_KEYS = ("source", "motion", "crop", "hflip", "offset", "pip", "pip_side", "sharpen")
+RENDER_KEYS = ("source", "motion", "crop", "hflip", "offset", "pip", "pip_side", "sharpen", "stagger", "focus", "sat")
+
+
+def stagger_expr(cut: dict, var: str, fps: int) -> str:
+    """Staggered punch-in: a zoom factor that steps up on each hit (ease-out over `dur`) and holds.
+    cut["stagger"] = {"at": [seconds from cut start], "step": 0.07, "dur": 0.08}; var = zoompan frame counter."""
+    st = cut.get("stagger")
+    if not st:
+        return "1"
+    terms = "".join(f"+{st.get('step', 0.07)}*(1-pow(1-clip(({var}/{fps}-{a})/{st.get('dur', 0.08)},0,1),3))"
+                    for a in st["at"])
+    return f"(1{terms})"
 
 
 def run(cmd: list[str]) -> None:
@@ -92,19 +103,28 @@ def render_segment(cut: dict, nframes: int, cfg: dict, out: Path) -> None:
         z0, z1 = {"kenburns-in": (1.0, 1.12), "kenburns-out": (1.12, 1.0)}.get(motion, (1.06, 1.06))
         z0, z1 = z0 * zoom, z1 * zoom
         dx = {"drift-left": 1, "drift-right": -1}.get(motion, 0)
+        fx, fy = cut.get("focus", [0.5, 0.5])                   # zoom centre (screen-normalised), default centre
+        zs = stagger_expr(cut, "on", fps)
         # Upscale first so zoompan's integer crop doesn't jitter (2x at HD, 1.25x at 4K to keep it fast).
         ss = 2 if max(W, H) <= 1920 else 1.25
         SW, SH = int(W * ss) // 2 * 2, int(H * ss) // 2 * 2
         vf = (f"scale={SW}:{SH}:force_original_aspect_ratio=increase:flags=lanczos,crop={SW}:{SH}{flip},"
-              f"zoompan=z='{z0}+({z1}-{z0})*on/{nframes}':x='iw/2-(iw/zoom/2)+{dx}*on/{nframes}*iw*0.04'"
-              f":y='ih/2-(ih/zoom/2)':d={nframes}:s={W}x{H}:fps={fps}")
+              f"zoompan=z='({z0}+({z1}-{z0})*on/{nframes})*{zs}':x='(iw-iw/zoom)*{fx}+{dx}*on/{nframes}*iw*0.04'"
+              f":y='(ih-ih/zoom)*{fy}':d={nframes}:s={W}x{H}:fps={fps}")
         inp = ["-loop", "1", "-framerate", str(fps), "-i", src]
     else:
         vf = (f"scale={int(W * zoom) // 2 * 2}:{int(H * zoom) // 2 * 2}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{H}{flip},"
               f"fps={fps}")
+        if cut.get("stagger"):   # punch-in steps on a video plate: per-frame zoompan toward `focus`
+            fx, fy = cut.get("focus", [0.5, 0.5])
+            vf += (f",zoompan=z='{stagger_expr(cut, 'in', fps)}':x='(iw-iw/zoom)*{fx}':y='(ih-ih/zoom)*{fy}'"
+                   f":d=1:s={W}x{H}:fps={fps}")
         if cut.get("sharpen"):   # light unsharp after upscaling a small plate (e.g. 720x1280 Veo Lite -> 1080x1920)
             vf += f",unsharp=5:5:{float(cut['sharpen']):.2f}:5:5:0"
         inp = ["-stream_loop", "-1", "-ss", str(cut.get("offset", 0.0)), "-i", src]
+    if cut.get("sat"):           # saturation ramp [from, to, t0, t1] (s from cut start): e.g. greyscale -> colour
+        s0, s1, a0, a1 = cut["sat"]
+        vf += f",hue=s='{s0}+({s1}-{s0})*clip((t-{a0})/{max(0.01, a1 - a0)},0,1)'"
     # One colour range for every segment: stills come out of zoompan as full-range yuvj420p, Veo clips are
     # limited-range yuv420p. Mixed in one chunk, xfade converts them all to full range, so the video shots in
     # mixed chunks got darker/contrastier than in video-only chunks (visible as brightness jumps between chunks).

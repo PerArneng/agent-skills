@@ -57,8 +57,8 @@ MIN_SCORE, GAP = a.min_score, a.gap
 # old line spans
 span = {}
 for w in old:
-    a, b = span.get(w["line"], (1e9, -1e9))
-    span[w["line"]] = (min(a, w["start"]), max(b, w["end"]))
+    s0, s1 = span.get(w["line"], (1e9, -1e9))
+    span[w["line"]] = (min(s0, w["start"]), max(s1, w["end"]))
 
 wav, sr = sf.read(a.stem, dtype="float32", always_2d=True)
 wav = torch.from_numpy(wav.mean(axis=1))

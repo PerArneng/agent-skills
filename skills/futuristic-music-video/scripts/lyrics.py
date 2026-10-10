@@ -108,12 +108,35 @@ def align(lines: list[list[str]], hyp: list[dict]) -> list[dict]:
     ref = [(li, w) for li, line in enumerate(lines) for w in line]
     a, b = [norm(w) for _, w in ref], [norm(h["text"]) for h in hyp]
     out: list[dict | None] = [None] * len(ref)
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
-        if tag == "equal" or (tag == "replace" and i2 - i1 == j2 - j1):
-            for k in range(i2 - i1):
-                h = hyp[j1 + k]
-                out[i1 + k] = {"start": h["start"], "end": h["end"], "prob": h["prob"],
-                               "src": "aligned" if tag == "equal" else "fuzzy"}
+    # Global (Needleman-Wunsch) alignment. difflib's longest-block-first matching jumps between repeated
+    # choruses: a cleanly heard 2nd chorus gets glued to the 1st in the text and everything between collapses.
+    n, m = len(a), len(b)
+    GAP = -1.0
+
+    def sub(x: str, y: str) -> float:
+        if x == y:
+            return 2.0
+        return 0.5 if difflib.SequenceMatcher(None, x, y).ratio() >= 0.5 else -0.5
+
+    S = [[0.0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        S[i][0] = i * GAP
+    for j in range(1, m + 1):
+        S[0][j] = j * GAP
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            S[i][j] = max(S[i - 1][j - 1] + sub(a[i - 1], b[j - 1]), S[i - 1][j] + GAP, S[i][j - 1] + GAP)
+    i, j = n, m
+    while i > 0 and j > 0:
+        if S[i][j] == S[i - 1][j - 1] + sub(a[i - 1], b[j - 1]):
+            h = hyp[j - 1]
+            out[i - 1] = {"start": h["start"], "end": h["end"], "prob": h["prob"],
+                          "src": "aligned" if a[i - 1] == b[j - 1] else "fuzzy"}
+            i, j = i - 1, j - 1
+        elif S[i][j] == S[i - 1][j] + GAP:
+            i -= 1
+        else:
+            j -= 1
     # interpolate unmatched runs between matched neighbours
     i = 0
     while i < len(out):

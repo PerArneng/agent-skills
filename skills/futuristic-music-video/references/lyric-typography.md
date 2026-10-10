@@ -1,6 +1,6 @@
 # Lyric typography: highlights, not subtitles
 
-Read this at step 7, before writing the lyric layer. These are lessons from "Agents in the Loop": the YouTube Short v3 was the first video built this way, and the user called it "a very good addition". The worked implementation is `youtube-shorts/assets/overlay/overlay.html` with `highlights.json` in that project. The API is summarised in `overlay-contract.md` → "Highlight lyrics".
+Read this at step 7, before writing the lyric layer. These are lessons from "Agents in the Loop": the YouTube Short v3 was the first video built this way, and the user called it "a very good addition". The worked implementation ships with the skill: `assets/examples/compile-the-future/overlay.html` + `highlights.json`. The API is summarised in `overlay-contract.md` → "Highlight lyrics".
 
 ## The principle
 **Lyrics are punctuation, not subtitles.**

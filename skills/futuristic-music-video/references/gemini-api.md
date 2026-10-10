@@ -33,6 +33,8 @@ Also available: `gemini-3.1-flash-lite-image` (Nano Banana 2 Lite) for very chea
 
 ## Observed limits (Agents in the Loop, Oct 2026, Tier 1 key)
 - **Daily request quota**: `429 RESOURCE_EXHAUSTED … exceeded your current quota`. Observed per model on a Tier 1 key: ~10 Lite calls/day, and Fast has its **own** quota (on 2026-10-04, 6 Fast calls went through right after Lite was exhausted). It resets at midnight Pacific (09:00 CEST). Backoff doesn't help; `veo_batch.py` stops after 2 in a row. When Lite runs out, the hero plates can go straight to Fast instead of Lite-then-Fast. Plan big passes across days, or render with still fallbacks and swap clips in later.
+- **Monthly spending cap** (a project setting in AI Studio): also `429 RESOURCE_EXHAUSTED`, with the message `Your project has exceeded its monthly spending cap`. It counts *all* usage on the key's project this month (other apps, text and TTS calls), not just this video's ledger, so it can trip at a low ledger total. Raise it at https://ai.studio/spend, or give the video its own project/key.
+- **Cost of a finished long-form video (Compile the Future, 5:14):** 26 stills + 22 Veo Fast 1080p clips (incl. one regeneration) = $29.83 total.
 - **402 vs 429:** don't grep a log for a bare "402" — Python tracebacks contain `line 402`. `veo_batch.py` matches `ClientError: 402` / `PAYMENT_REQUIRED` only; an earlier version misreported a quota stop as "credits used up".
 - **402 "prepayment credits are depleted"**: prepaid billing ran out mid-batch. Top up and re-run (finished plates are skipped).
 - **Safety filter** ("Veo returned no video (possibly filtered)", not charged): hit twice on a realistic close-up of the singer's face "singing to camera"; a different still and framing passed first time.
