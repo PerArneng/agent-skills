@@ -119,10 +119,23 @@ class ScriptFailure(Exception):
 
 
 def find_subcommands(help_text: str) -> list[str]:
-    """argparse prints subcommands as `{a,b,c}` in the usage line."""
+    """argparse prints subcommands as `{a,b,c}` in the usage line.
+
+    Option choices look the same (`--mode {a,b}`), so a brace group right after an option flag is skipped.
+    A positional with choices still matches; collect_help() drops those by checking each `<sub> --help`.
+    """
     usage = help_text.split("\n\n", 1)[0]
-    match = re.search(r"\{([\w,\-]+)\}", usage)
-    return match.group(1).split(",") if match else []
+    for match in re.finditer(r"\{([\w,\-]+)\}", usage):
+        if re.search(r"(?:^|\s|\[)-{1,2}[\w\-]+\s*$", usage[: match.start()]):
+            log.debug("skipping option choices %s", kv(choices=match.group(0)))
+            continue
+        return match.group(1).split(",")
+    return []
+
+
+def is_subcommand_help(name: str, sub: str, help_text: str) -> bool:
+    """A real subcommand's help starts with `usage: <name> <sub>`; a positional choice prints the top help."""
+    return re.match(rf"usage: {re.escape(name)} {re.escape(sub)}(\s|$)", help_text) is not None
 
 
 def render_block(sections: list[tuple[str, str]]) -> str:
@@ -145,9 +158,12 @@ def replace_block(source: str, block: str) -> str:
 def collect_help(name: str, run_help: Callable[[list[str]], str]) -> list[tuple[str, str]]:
     top = run_help([])
     sections = [(f"{name} --help", top)]
-    subs = find_subcommands(top)
-    log.info("found subcommands %s", kv(count=len(subs), names=",".join(subs) or "-"))
-    sections += [(f"{name} {sub} --help", run_help([sub])) for sub in subs]
+    found = find_subcommands(top)
+    subs = [(sub, out) for sub in found if is_subcommand_help(name, sub, out := run_help([sub]))]
+    if len(subs) < len(found):
+        log.debug("not subcommands, positional choices %s", kv(names=",".join(sorted(set(found) - {s for s, _ in subs}))))
+    log.info("found subcommands %s", kv(count=len(subs), names=",".join(s for s, _ in subs) or "-"))
+    sections += [(f"{name} {sub} --help", out) for sub, out in subs]
     return sections
 
 
